@@ -81,6 +81,7 @@ import io.github.lingqiqi5211.ezhooktool.core.loadClass
 import io.github.lingqiqi5211.ezhooktool.core.java.Constructors
 import io.github.lingqiqi5211.ezhooktool.xposed.EzXposed
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createAfterHook
+import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createBeforeHook
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createInterceptHook
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createHook
 import java.util.concurrent.ConcurrentHashMap
@@ -113,6 +114,12 @@ object MobileTypeSingle2Hook : BaseHook() {
 
     @Volatile
     private var isWifiDefaultConnection: Boolean? = null
+
+    /**
+     * VMs (by identityHashCode) already handled on the bind path, so the flows are not
+     * replaced again for every location.
+     */
+    private val appliedViewModels = ConcurrentHashMap.newKeySet<Int>()
 
     private val boundViews = ConcurrentHashMap<Int, MutableSet<ViewGroup>>()
     private val renderStateStore = MobileTypeRenderStateStore()
@@ -155,72 +162,128 @@ object MobileTypeSingle2Hook : BaseHook() {
             }
         }
 
-        Constructors.find(miuiCellularIconVM).first().createAfterHook { param ->
-            val viewModel = param.thisObject
-            val interactor = param.args[1]
-            val miuiInteractor = param.args[2]
-
-            viewModel.setAdditionalInstanceField("interactor", interactor)
-            viewModel.setObjectField("wifiAvailable", miuiInteractor?.getObjectField("wifiAvailable"))
-
-            val subId = runCatching {
-                miuiInteractor?.getObjectFieldAs<Int>("subId")
-            }.getOrNull() ?: runCatching {
-                interactor?.getObjectFieldAs<Int>("subId")
-            }.getOrNull() ?: runCatching {
-                viewModel.getObjectFieldAs<Int>("subId")
-            }.getOrNull() ?: return@createAfterHook
-
-            val slotIndex = SubscriptionManager.getSlotIndex(subId)
-            if (isEnableDouble) {
-                viewModel.getObjectField("showName")?.let { originalFlow ->
-                    showNameFlowProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
-                    if (slotIndex == 0) {
-                        viewModel.setObjectField("showName", showNameFlowProxy.proxy!!)
-                    }
-                }
-                if (!hideIndicator) {
-                    viewModel.getObjectField("inOutVisible")?.let { originalFlow ->
-                        inOutVisibleProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
-                        if (slotIndex == 0) {
-                            viewModel.setObjectField("inOutVisible", inOutVisibleProxy.proxy!!)
-                        }
-                    }
-                    viewModel.getObjectField("inOutResId")?.let { originalFlow ->
-                        inOutResIdProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
-                        if (slotIndex == 0) {
-                            viewModel.setObjectField("inOutResId", inOutResIdProxy.proxy!!)
-                        }
-                    }
-                }
-                viewModel.getObjectField("mobileTypeSingleVisible")?.let { originalFlow ->
-                    mobileTypeSingleVisibleProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
-                    if (slotIndex == 0) {
-                        viewModel.setObjectField("mobileTypeSingleVisible", mobileTypeSingleVisibleProxy.proxy!!)
-                    }
-                }
-                viewModel.getObjectField("mobileTypeVisible")?.let { originalFlow ->
-                    mobileTypeVisibleProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
-                    if (slotIndex == 0) {
-                        viewModel.setObjectField("mobileTypeVisible", mobileTypeVisibleProxy.proxy!!)
-                    }
-                }
+        // OS 2.x / OS 3.0: MiuiCellularIconVM still has an <init>, so keep the original
+        // constructor hook.
+        if (miuiCellularIconVM.declaredConstructors.isNotEmpty()) {
+            Constructors.find(miuiCellularIconVM).first().createAfterHook { param ->
+                applyToViewModel(param.thisObject, param.args[1], param.args[2])
             }
-
-            registerMobileStateCollectors(
-                viewModel,
-                interactor,
-                subId,
-                slotIndex
-            )
-
-            if (isEnableDouble) {
-                syncDataSimProxiesNow()
-                registerDataSimBroadcast()
-            }
-            scheduleRefreshBoundViews()
+        } else {
+            // HyperOS 3.3 (Android 17): R8 inlined MiuiCellularIconVM's constructor away,
+            // so Constructors.find(...).first() throws MemberNotFoundException and the
+            // whole hook is lost. Handle it before MiuiMobileIconBinder#bind instead,
+            // where args[2] is the VM. Both interactors that used to be constructor
+            // arguments are reachable from the VM itself on the new version:
+            //   args[1] interactor     -> originIconInteractor
+            //   args[2] miuiInteractor -> only used to read wifiAvailable, and the new VM
+            //                             already has that field, so null is passed here
+            //                             and the copy is simply skipped.
+            miuiMobileIconBinder.findMethod { name("bind") }
+                .createBeforeHook { param ->
+                    // bind receives a MiuiMobileIconVMImpl wrapper whose inOutVisible /
+                    // mobileTypeVisible are ChannelFlowTransformLatest (cold flows, no
+                    // getValue) and which has no wifiAvailable field. The original
+                    // constructor hook saw the inner MiuiCellularIconVM, where all of
+                    // these are ReadonlyStateFlow, so unwrap first.
+                    val viewModel = unwrapCellProviderViewModel(param.args[2])
+                        ?: return@createBeforeHook
+                    // bind is called once per location for the same VM; register it only
+                    // after success so a single failure does not skip it forever
+                    val viewModelKey = System.identityHashCode(viewModel)
+                    if (viewModelKey in appliedViewModels) return@createBeforeHook
+                    val interactor = runCatching {
+                        viewModel.callMethodAs<Any>("getOriginIconInteractor")
+                    }.getOrNull() ?: return@createBeforeHook
+                    applyToViewModel(viewModel, interactor, null)
+                    appliedViewModels.add(viewModelKey)
+                }
         }
 
+        hookMobileViewExtras()
+    }
+
+    /**
+     * Resolves the subId.
+     *
+     * Older versions read subId straight off the interactor passed as a constructor
+     * argument. On HyperOS 3.3 that field was renamed to subscriptionId on
+     * MobileIconInteractorImpl (with a matching getSubscriptionId()). The old name is
+     * tried first, so older versions keep hitting the same branch as before.
+     */
+    private fun resolveSubId(viewModel: Any, interactor: Any?, miuiInteractor: Any?): Int? {
+        val candidates = listOfNotNull(miuiInteractor, interactor, viewModel)
+        for (target in candidates) {
+            runCatching { target.getObjectFieldAs<Int>("subId") }.getOrNull()?.let { return it }
+        }
+        for (target in candidates) {
+            runCatching { target.getObjectFieldAs<Int>("subscriptionId") }.getOrNull()?.let { return it }
+            runCatching { target.callMethodAs<Int>("getSubscriptionId") }.getOrNull()?.let { return it }
+        }
+        return null
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun applyToViewModel(viewModel: Any, interactor: Any?, miuiInteractor: Any?) {
+        viewModel.setAdditionalInstanceField("interactor", interactor)
+        // The new VM already owns a wifiAvailable field, so there is nothing to copy when
+        // no miuiInteractor was supplied
+        if (miuiInteractor != null) {
+            viewModel.setObjectField("wifiAvailable", miuiInteractor.getObjectField("wifiAvailable"))
+        }
+
+        val subId = resolveSubId(viewModel, interactor, miuiInteractor) ?: return
+
+        val slotIndex = SubscriptionManager.getSlotIndex(subId)
+        if (isEnableDouble) {
+            viewModel.getObjectField("showName")?.let { originalFlow ->
+                showNameFlowProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
+                if (slotIndex == 0) {
+                    viewModel.setObjectField("showName", showNameFlowProxy.proxy!!)
+                }
+            }
+            if (!hideIndicator) {
+                viewModel.getObjectField("inOutVisible")?.let { originalFlow ->
+                    inOutVisibleProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
+                    if (slotIndex == 0) {
+                        viewModel.setObjectField("inOutVisible", inOutVisibleProxy.proxy!!)
+                    }
+                }
+                viewModel.getObjectField("inOutResId")?.let { originalFlow ->
+                    inOutResIdProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
+                    if (slotIndex == 0) {
+                        viewModel.setObjectField("inOutResId", inOutResIdProxy.proxy!!)
+                    }
+                }
+            }
+            viewModel.getObjectField("mobileTypeSingleVisible")?.let { originalFlow ->
+                mobileTypeSingleVisibleProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
+                if (slotIndex == 0) {
+                    viewModel.setObjectField("mobileTypeSingleVisible", mobileTypeSingleVisibleProxy.proxy!!)
+                }
+            }
+            viewModel.getObjectField("mobileTypeVisible")?.let { originalFlow ->
+                mobileTypeVisibleProxy.setupForSlot(slotIndex, subId, originalFlow, MobileViewHelper::isSingleSimMode)
+                if (slotIndex == 0) {
+                    viewModel.setObjectField("mobileTypeVisible", mobileTypeVisibleProxy.proxy!!)
+                }
+            }
+        }
+
+        registerMobileStateCollectors(
+            viewModel,
+            interactor,
+            subId,
+            slotIndex
+        )
+
+        if (isEnableDouble) {
+            syncDataSimProxiesNow()
+            registerDataSimBroadcast()
+        }
+        scheduleRefreshBoundViews()
+    }
+
+    private fun hookMobileViewExtras() {
         modernStatusBarMobileView.findAllMethods { name("constructAndBind") }
             .forEach { method ->
                 method.createInterceptHook { chain ->
@@ -250,9 +313,24 @@ object MobileTypeSingle2Hook : BaseHook() {
     }
 
     private fun showMobileTypeSingle() {
-        mOperatorConfig.constructors[0].createAfterHook {
-            it.thisObject.setObjectField("showMobileDataTypeSingle", true)
+        // OS 2.x / OS 3.0: OperatorConfig still has an <init>.
+        val constructors = mOperatorConfig.constructors
+        if (constructors.isNotEmpty()) {
+            constructors[0].createAfterHook {
+                it.thisObject.setObjectField("showMobileDataTypeSingle", true)
+            }
+            return
         }
+
+        // HyperOS 3.3 (Android 17): R8 inlined OperatorConfig's constructor into
+        // MiuiOperatorCustomizedPolicy#getMiuiOperatorConfig (see HideVoWiFiIcon), so
+        // constructors[0] throws ArrayIndexOutOfBoundsException. Hook that method's
+        // return value instead.
+        loadClass("com.android.systemui.MiuiOperatorCustomizedPolicy")
+            .findMethod { name("getMiuiOperatorConfig") }
+            .createAfterHook { param ->
+                param.result?.setObjectField("showMobileDataTypeSingle", true)
+            }
     }
 
     private fun unwrapCellProviderViewModel(viewModel: Any?): Any? {
