@@ -79,7 +79,7 @@ public class StatusBarIcon extends BaseHook {
 
     private void trySetBlockList(Class<?> clazz, String fieldName, List<String> value) {
         try {
-            com.sevtinge.hyperceiler.libhook.base.BaseHook.setStaticObjectField(clazz, fieldName, value);
+            BaseHook.setStaticObjectField(clazz, fieldName, value);
         } catch (Throwable t) {
             XposedLog.w(TAG, getPackageName(),
                 "skip writing back " + fieldName + " (already mutated in place): " + t.getMessage());

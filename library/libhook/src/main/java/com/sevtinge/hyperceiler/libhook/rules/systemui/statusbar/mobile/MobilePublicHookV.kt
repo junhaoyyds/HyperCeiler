@@ -61,14 +61,13 @@ class MobilePublicHookV : BaseHook() {
         const val STATE_CONTEXT = "MobilePublicHookV.context"
         const val STATE_SUB_IDS = "MobilePublicHookV.subIds"
         const val STATE_FLOW_PREFIX = "MobilePublicHookV.flow."
+        const val FIELD_IS_VISIBLE = "isVisible"
     }
 
     private val visibilityFlows = ConcurrentHashMap<Int, Any>()
 
-    /**
-     * MiuiCellularIconVM instances (by identityHashCode) already handled on the bind
-     * path, so the flows are not replaced again for every location.
-     */
+    // MiuiCellularIconVM instances (by identityHashCode) already handled on the bind
+    // path, so the flows are not replaced again for every location.
     private val appliedViewModels = ConcurrentHashMap.newKeySet<Int>()
 
     @Volatile
@@ -85,10 +84,7 @@ class MobilePublicHookV : BaseHook() {
         // constructor hook.
         if (miuiCellularIconVM.declaredConstructors.isNotEmpty()) {
             miuiCellularIconVM.hookAllConstructors {
-                after { param ->
-                    val mobileIconInteractor = param.args[2] ?: return@after
-                    applyToViewModel(param.thisObject, mobileIconInteractor)
-                }
+                after { param -> applyToViewModel(param.thisObject, param.args[2]) }
             }
             return
         }
@@ -104,52 +100,53 @@ class MobilePublicHookV : BaseHook() {
         // before-hook runs prior to the official bind collecting these flows, so the
         // replacement happens at the same point in time as the constructor hook did.
         miuiMobileIconBinder.findMethod { name("bind") }
-            .createBeforeHook { param ->
-                val cellularIcon = param.args[2] ?: return@createBeforeHook
-                // bind is called once per location (status bar / keyguard / control
-                // center) for the same VM, so only the first call is handled. Register
-                // the VM only after it succeeded, otherwise a single failure would make
-                // this VM be skipped forever.
-                val viewModelKey = System.identityHashCode(cellularIcon)
-                if (viewModelKey in appliedViewModels) return@createBeforeHook
-                val mobileIconInteractor = runCatching {
-                    cellularIcon.callMethodAs<Any>("getOriginIconInteractor")
-                }.getOrNull() ?: return@createBeforeHook
-                applyToViewModel(cellularIcon, mobileIconInteractor)
-                appliedViewModels.add(viewModelKey)
-            }
+            .createBeforeHook { param -> applyOnBind(param.args[2]) }
     }
 
-    /**
-     * Resolves the subId.
-     *
-     * On the old constructor-hook path args[2] is the MIUI-side interactor, which has a
-     * plain subId field. On HyperOS 3.3 (Android 17) the object reached through bind is a
-     * MobileIconInteractorImpl, where the field was renamed to subscriptionId (with a
-     * matching getSubscriptionId()), so reading subId throws MemberNotFoundException.
-     * The old name is tried first so behaviour on older versions is unchanged.
-     */
+    // bind is called once per location (status bar / keyguard / control center) for the
+    // same VM, so only the first call is handled. The VM is registered only after it
+    // succeeded, otherwise a single failure would make this VM be skipped forever.
+    @RequiresPermission(allOf = [Manifest.permission.ACCESS_NETWORK_STATE, Manifest.permission.READ_PHONE_STATE])
+    private fun applyOnBind(boundViewModel: Any?) {
+        val cellularIcon = boundViewModel ?: return
+        val viewModelKey = System.identityHashCode(cellularIcon)
+        if (viewModelKey in appliedViewModels) return
+        val mobileIconInteractor = runCatching {
+            cellularIcon.callMethodAs<Any>("getOriginIconInteractor")
+        }.getOrNull() ?: return
+        applyToViewModel(cellularIcon, mobileIconInteractor)
+        appliedViewModels.add(viewModelKey)
+    }
+
+    // Resolves the subId.
+    //
+    // On the old constructor-hook path args[2] is the MIUI-side interactor, which has a
+    // plain subId field. On HyperOS 3.3 (Android 17) the object reached through bind is a
+    // MobileIconInteractorImpl, where the field was renamed to subscriptionId (with a
+    // matching getSubscriptionId()), so reading subId throws MemberNotFoundException.
+    // The old name is tried first so behaviour on older versions is unchanged.
     private fun resolveSubId(interactor: Any): Int? =
         runCatching { interactor.getObjectFieldAs<Int>("subId") }.getOrNull()
             ?: runCatching { interactor.getObjectFieldAs<Int>("subscriptionId") }.getOrNull()
             ?: runCatching { interactor.callMethodAs<Int>("getSubscriptionId") }.getOrNull()
 
     @RequiresPermission(allOf = [Manifest.permission.ACCESS_NETWORK_STATE, Manifest.permission.READ_PHONE_STATE])
-    private fun applyToViewModel(cellularIcon: Any, mobileIconInteractor: Any) {
-        val subId = resolveSubId(mobileIconInteractor) ?: return
+    private fun applyToViewModel(cellularIcon: Any, mobileIconInteractor: Any?) {
+        val interactor = mobileIconInteractor ?: return
+        val subId = resolveSubId(interactor) ?: return
         val isVisible = createVisibilityFlow()
 
         when {
             // 信号显示逻辑
             signalShowMode >= 1 -> {
-                cellularIcon.setObjectField("isVisible", isVisible)
+                cellularIcon.setObjectField(FIELD_IS_VISIBLE, isVisible)
                 trackVisibilityFlow(subId, isVisible)
                 refreshVisibility(subId, isVisible)
                 registerReceiver(EzXposed.appContext)
             }
             // 双排信号（signalShowMode == 0 且未隐藏卡）
             isEnableDouble && !(card1 || card2) -> {
-                cellularIcon.setObjectField("isVisible", isVisible)
+                cellularIcon.setObjectField(FIELD_IS_VISIBLE, isVisible)
                 trackVisibilityFlow(subId, isVisible)
                 val slotIndex = SubscriptionManager.getSlotIndex(subId)
                 val shouldShow = !MobileViewHelper.isAirplaneModeOn() &&
@@ -161,7 +158,7 @@ class MobilePublicHookV : BaseHook() {
             else -> {
                 val slotIndex = SubscriptionManager.getSlotIndex(subId)
                 if ((card1 && slotIndex == 0) || (card2 && slotIndex == 1)) {
-                    cellularIcon.setObjectField("isVisible", isVisible)
+                    cellularIcon.setObjectField(FIELD_IS_VISIBLE, isVisible)
                 }
             }
         }
@@ -210,9 +207,9 @@ class MobilePublicHookV : BaseHook() {
             ?.split(',')
             ?.mapNotNull { it.toIntOrNull() }
             .orEmpty()
-        savedIds.forEach { subId ->
+        for (subId in savedIds) {
             val flow = BaseHook.getHotReloadRuntimeState("$STATE_FLOW_PREFIX$subId", Any::class.java)
-                ?: return@forEach
+                ?: continue
             if (flow.javaClass.classLoader !== javaClass.classLoader) {
                 visibilityFlows[subId] = flow
             }
