@@ -76,34 +76,75 @@ jobs:
         run: |
           DATE=$(TZ=Asia/Shanghai date +%Y-%m-%d)
           TAG="nightly-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+          BT="${{ github.event.inputs.buildType || 'canary' }}"
+          COMMIT=$(git rev-parse --short HEAD)
+          VERSION=$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)
+          BUILDTIME=$(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')
+          APKNAME="${{ steps.apk.outputs.name }}"
           PREV=$(git tag -l 'nightly-*' --sort=-creatordate | head -n1)
           if [ -n "$PREV" ]; then RANGE="$PREV..HEAD"; else RANGE="HEAD"; fi
+          if [ -n "$PREV" ]; then
+            COMMITS=$(git log --no-merges --pretty=format:"- %s (%h)" "$RANGE")
+          else
+            COMMITS=$(git log --no-merges --pretty=format:"- %s (%h)" -n 30)
+          fi
+
           {
-            echo "# Nightly $DATE"
+            echo "# 夜版构建日志 / Nightly Build Log"
             echo ""
-            echo "- **Build type**: \`${{ github.event.inputs.buildType || 'canary' }}\`"
-            echo "- **Commit**: \`$(git rev-parse --short HEAD)\`"
-            echo "- **Version**: \`$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)\`"
-            echo "- **Build time**: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')"
-            echo "- **Artifact**: \`${{ steps.apk.outputs.name }}\`"
+            echo "## 中文（默认）"
             echo ""
-            echo "## Changes since last nightly"
+            echo "- **构建类型**: \`$BT\`"
+            echo "- **提交**: \`$COMMIT\`"
+            echo "- **版本**: \`$VERSION\`"
+            echo "- **构建时间**: $BUILDTIME"
+            echo "- **产物**: \`$APKNAME\`"
             echo ""
-            if [ -n "$PREV" ]; then
-              git log --no-merges --pretty=format:"- %s (%h)" "$RANGE"
-            else
-              git log --no-merges --pretty=format:"- %s (%h)" -n 30
-            fi
+            echo "### 相对上次夜版的改动"
+            echo ""
+            echo "$COMMITS"
             echo ""
           } > CHANGELOG.md
+
+          {
+            echo "# Nightly Build Log"
+            echo ""
+            echo "## English"
+            echo ""
+            echo "- **Build type**: \`$BT\`"
+            echo "- **Commit**: \`$COMMIT\`"
+            echo "- **Version**: \`$VERSION\`"
+            echo "- **Build time**: $BUILDTIME"
+            echo "- **Artifact**: \`$APKNAME\`"
+            echo ""
+            echo "### Changes since last nightly"
+            echo ""
+            echo "$COMMITS"
+            echo ""
+          } > CHANGELOG_EN.md
+
+          {
+            cat CHANGELOG.md
+            echo ""
+            echo "---"
+            echo ""
+            cat CHANGELOG_EN.md
+          } > RELEASE_NOTES.md
+
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "===== CHANGELOG.md (zh) ====="
           cat CHANGELOG.md
+          echo "===== CHANGELOG_EN.md (en) ====="
+          cat CHANGELOG_EN.md
 
       - name: Create GitHub Release (nightly)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.clog.outputs.tag }}" "${{ steps.apk.outputs.path }}" \
+          gh release create "${{ steps.clog.outputs.tag }}" \
+            "${{ steps.apk.outputs.path }}" \
+            CHANGELOG.md \
+            CHANGELOG_EN.md \
             --title "Nightly ${{ steps.clog.outputs.tag }}" \
-            --notes-file CHANGELOG.md \
+            --notes-file RELEASE_NOTES.md \
             --prerelease
