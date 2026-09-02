@@ -1,0 +1,109 @@
+name: Nightly Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      buildType:
+        description: "Build type to release as nightly (canary/release/beta/debug)"
+        required: true
+        default: "canary"
+        type: choice
+        options:
+          - canary
+          - release
+          - beta
+          - debug
+  schedule:
+    # 姣忓ぉ 01:00 (Asia/Shanghai) 鑷姩鍑哄鐗?    - cron: "0 17 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  nightly:
+    name: Build Nightly APK
+    runs-on: macos-latest
+    env:
+      GIT_ACTOR: ${{ secrets.GIT_ACTOR }}
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: true
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-overwrite-existing: true
+
+      - name: Ensure Android SDK (API 37)
+        run: |
+          ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          [ -x "$SDKMANAGER" ] || SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -n "$SDKMANAGER" ]; then
+            export PATH="$(dirname "$SDKMANAGER"):$PATH"
+            yes | sdkmanager "platforms;android-37" "build-tools;37.0.0" || \
+            yes | sdkmanager --channel=3 "platforms;android-37" "build-tools;37.0.0" || true
+          else
+            echo "sdkmanager not found; relying on the runner's preinstalled Android SDK."
+          fi
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build APK
+        run: ./gradlew assemble${{ github.event.inputs.buildType || 'canary' }}
+
+      - name: Locate APK
+        id: apk
+        run: |
+          BT="${{ github.event.inputs.buildType || 'canary' }}"
+          APK=$(find app/build/outputs/apk/"$BT" -name '*.apk' | head -n1)
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$APK")" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog & tag
+        id: clog
+        run: |
+          DATE=$(TZ=Asia/Shanghai date +%Y-%m-%d)
+          TAG="nightly-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
+          PREV=$(git tag -l 'nightly-*' --sort=-creatordate | head -n1)
+          if [ -n "$PREV" ]; then RANGE="$PREV..HEAD"; else RANGE="HEAD"; fi
+          {
+            echo "# Nightly $DATE"
+            echo ""
+            echo "- **Build type**: \`${{ github.event.inputs.buildType || 'canary' }}\`"
+            echo "- **Commit**: \`$(git rev-parse --short HEAD)\`"
+            echo "- **Version**: \`$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)\`"
+            echo "- **Build time**: $(TZ=Asia/Shanghai date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "- **Artifact**: \`${{ steps.apk.outputs.name }}\`"
+            echo ""
+            echo "## Changes since last nightly"
+            echo ""
+            if [ -n "$PREV" ]; then
+              git log --no-merges --pretty=format:"- %s (%h)" "$RANGE"
+            else
+              git log --no-merges --pretty=format:"- %s (%h)" -n 30
+            fi
+            echo ""
+          } > CHANGELOG.md
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          cat CHANGELOG.md
+
+      - name: Create GitHub Release (nightly)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.clog.outputs.tag }}" "${{ steps.apk.outputs.path }}" \
+            --title "Nightly ${{ steps.clog.outputs.tag }}" \
+            --notes-file CHANGELOG.md \
+            --prerelease
