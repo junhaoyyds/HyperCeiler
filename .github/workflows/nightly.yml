@@ -13,9 +13,6 @@ on:
           - release
           - beta
           - debug
-  schedule:
-    # 姣忓ぉ 01:00 (Asia/Shanghai) 鑷姩鍑哄鐗?    - cron: "0 17 * * *"
-
 permissions:
   contents: write
 
