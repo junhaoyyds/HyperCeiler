@@ -13,6 +13,9 @@ on:
           - release
           - beta
           - debug
+  schedule:
+    - cron: "0 17 * * *"
+
 permissions:
   contents: write
 
