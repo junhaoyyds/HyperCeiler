@@ -33,18 +33,43 @@ jobs:
           fetch-depth: 0
           submodules: true
 
+      - name: Skip guard (no new commits)
+        id: guard
+        run: |
+          # Manual dispatch always builds; only the scheduled run guards against no-op rebuilds.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST_TAG=$(git tag -l 'nightly-*' --sort=-creatordate | head -n1)
+          if [ -z "$LAST_TAG" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          LAST_COMMIT=$(git rev-list -n1 "$LAST_TAG")
+          HEAD_COMMIT=$(git rev-parse HEAD)
+          if [ "$LAST_COMMIT" = "$HEAD_COMMIT" ]; then
+            echo "No new commits since $LAST_TAG; skipping nightly build."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Set up JDK 25
+        if: steps.guard.outputs.skip != 'true'
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "25"
 
       - name: Set up Gradle
+        if: steps.guard.outputs.skip != 'true'
         uses: gradle/actions/setup-gradle@v6
         with:
           cache-overwrite-existing: true
 
       - name: Ensure Android SDK (API 37)
+        if: steps.guard.outputs.skip != 'true'
         run: |
           ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
           SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
@@ -58,13 +83,16 @@ jobs:
           fi
 
       - name: Make gradlew executable
+        if: steps.guard.outputs.skip != 'true'
         run: chmod +x gradlew
 
       - name: Build APK
+        if: steps.guard.outputs.skip != 'true'
         run: ./gradlew assemble${{ github.event.inputs.buildType || 'canary' }}
 
       - name: Locate APK
         id: apk
+        if: steps.guard.outputs.skip != 'true'
         run: |
           BT="${{ github.event.inputs.buildType || 'canary' }}"
           APK=$(find app/build/outputs/apk/"$BT" -name '*.apk' | head -n1)
@@ -73,6 +101,7 @@ jobs:
 
       - name: Generate changelog & tag
         id: clog
+        if: steps.guard.outputs.skip != 'true'
         run: |
           DATE=$(TZ=Asia/Shanghai date +%Y-%m-%d)
           TAG="nightly-$(TZ=Asia/Shanghai date +%Y%m%d-%H%M%S)"
@@ -138,6 +167,7 @@ jobs:
           cat CHANGELOG_EN.md
 
       - name: Create GitHub Release (nightly)
+        if: steps.guard.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
