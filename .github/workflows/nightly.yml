@@ -125,7 +125,7 @@ jobs:
 
           echo "== Re-sign with runner debug keystore (== nightly signing key) =="
           KS=""
-          for c in "$HOME/.android/debug.keystore" "$ANDROID_HOME/.android/debug.keystore" "$ANDROID_SDK_HOME/.android/debug.keystore" "${ANDROID_USER_HOME:-$HOME/.android}/debug.keystore"; do
+          for c in "$HOME/.android/debug.keystore" "${ANDROID_HOME:-}/.android/debug.keystore" "${ANDROID_SDK_HOME:-}/.android/debug.keystore" "${ANDROID_USER_HOME:-$HOME/.android}/debug.keystore"; do
             [ -f "$c" ] && KS="$c" && break
           done
           if [ -z "$KS" ]; then
