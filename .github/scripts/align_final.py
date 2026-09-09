@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Repack an APK preserving every entry's *logical* content, and force 4KB
-page-alignment on STORED native libraries (.so) plus 4-byte alignment on other
-STORED entries.
+"""Repack an APK so that native libraries (.so) are forced STORED + 4KB
+page-aligned, inject the desktop dock hook registration, and drop stale v1
+signatures so jarsigner can re-sign.
 
-This is the FINAL step after v1 (jarsigner) signing. It rewrites the zip
-structure but keeps every entry's content byte-identical (DEFLATE entries are
-re-compressed with raw deflate, so the uncompressed bytes -- what v1 signs --
-are unchanged), so the existing JAR (v1) signature remains valid.
+Pure-python, no external zipalign/apksigner required.
 
-No external tools (zipalign/apksigner) required.
+Why STORED + 4KB-aligned .so is mandatory:
+  On modern Android (extractNativeLibs defaults to false), the package
+  manager mmaps .so directly from the APK. That requires the .so entry to be
+  stored uncompressed (STORED) AND 4KB page-aligned (Android extra field
+  0xD935). Otherwise installation fails with:
+      INSTALL_FAILED_INVALID_APK: Failed to extract native libraries, res=-2
 """
 import struct, sys, os, zipfile, zlib
 
@@ -27,10 +29,29 @@ def dos_date(dt):
     return ((y - 1980) << 9) | (mo << 5) | d
 
 
+def strip_align_marker(extra):
+    """Remove any existing 0xD935 alignment records so we recompute against the
+    new layout (stale offsets from the source would be wrong)."""
+    tag = ALIGN_MARKER.to_bytes(2, "little")
+    if tag not in extra:
+        return extra
+    out = b""
+    i = 0
+    while i + 4 <= len(extra):
+        hid = struct.unpack_from("<H", extra, i)[0]
+        hsz = struct.unpack_from("<H", extra, i + 2)[0]
+        if hid == ALIGN_MARKER:
+            i += 4 + hsz
+            continue
+        out += extra[i:i + 4 + hsz]
+        i += 4 + hsz
+    return out
+
+
 def repack(src_path, dst_path, native_init=None):
     src = zipfile.ZipFile(src_path)
     infos = src.infolist()
-    # Decompressed bytes for every entry (v1 signature covers these).
+    # Decompressed bytes for every entry (what a v1 signature covers).
     plain = {it.filename: src.read(it.filename) for it in infos}
     src.close()
 
@@ -51,29 +72,33 @@ def repack(src_path, dst_path, native_init=None):
         if name in skip:
             continue
         pdata = plain[name]
-        ctype = it.compress_type
         is_so = name.endswith(".so")
-        align = PAGE if (ctype == zipfile.ZIP_STORED and is_so) else (MIN_ALIGN if ctype == zipfile.ZIP_STORED else 1)
-
-        # Determine the bytes to write into the archive.
-        if ctype == zipfile.ZIP_DEFLATED:
-            co = zlib.compressobj(9, zlib.DEFLATED, -15)  # raw deflate, no zlib header
-            wbytes = co.compress(pdata) + co.flush()
+        if is_so:
+            # FORCE STORED + 4KB page-aligned, independent of source compression.
+            ctype = zipfile.ZIP_STORED
+            align = PAGE
+            wbytes = pdata  # pdata is the correct (decompressed) content
             csize = len(wbytes)
         else:
-            wbytes = pdata  # STORED: write raw bytes as-is
-            csize = len(wbytes)
+            ctype = it.compress_type
+            align = MIN_ALIGN if ctype == zipfile.ZIP_STORED else 1
+            if ctype == zipfile.ZIP_DEFLATED:
+                co = zlib.compressobj(9, zlib.DEFLATED, -15)  # raw deflate
+                wbytes = co.compress(pdata) + co.flush()
+                csize = len(wbytes)
+            else:
+                wbytes = pdata
+                csize = len(wbytes)
         usize = len(pdata)
         crc = it.CRC
 
         name_b = name.encode("utf-8")
+        extra = strip_align_marker(it.extra)
         if align > 1:
-            pre = pos + 30 + len(name_b) + len(it.extra)
+            pre = pos + 30 + len(name_b) + len(extra)
             pad = (align - ((pre + 4) % align)) % align
             rec = struct.pack("<HH", ALIGN_MARKER, pad) + (b"\x00" * pad)
-            extra = it.extra + rec
-        else:
-            extra = it.extra
+            extra = extra + rec
 
         local_offset = pos
         flags = it.flag_bits & ~0x08  # drop data-descriptor bit; sizes in header
@@ -120,7 +145,7 @@ def repack(src_path, dst_path, native_init=None):
         cd += name_b + extra
         central.append(cd)
 
-    # Inject desktop dock hook registration (must be STORED, 4-byte aligned).
+    # Inject desktop dock hook registration (STORED, 4-byte aligned).
     if native_init is not None and native_init[0] not in plain:
         name = native_init[0]
         pdata = native_init[1]
