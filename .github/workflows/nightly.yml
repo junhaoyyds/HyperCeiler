@@ -99,6 +99,46 @@ jobs:
           echo "path=$APK" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$APK")" >> "$GITHUB_OUTPUT"
 
+      - name: Inject desktop dock hook (native_init.list) and re-sign with nightly debug key
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          APK="${{ steps.apk.outputs.path }}"
+          echo "== Inject desktop dock hook into $APK =="
+          python3 - <<'PY'
+          import zipfile, os
+          apk = os.environ["APK"]
+          tmp = apk + ".inject.tmp"
+          src = zipfile.ZipFile(apk)
+          entries = [(i.filename, src.read(i.filename)) for i in src.infolist()
+                     if i.filename != "META-INF/xposed/native_init.list"]
+          with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+              for name, data in entries:
+                  out.writestr(name, data)
+              out.writestr("META-INF/xposed/native_init.list", "libhyperceiler_home.so\n")
+          os.replace(tmp, apk)
+          with zipfile.ZipFile(apk) as z:
+              assert "META-INF/xposed/native_init.list" in z.namelist(), "native_init.list missing!"
+              assert "lib/arm64-v8a/libhyperceiler_home.so" in z.namelist(), "home.so missing!"
+              print("OK native_init.list =>", z.read("META-INF/xposed/native_init.list").decode().strip())
+          PY
+
+          echo "== Re-sign with runner debug keystore (== nightly signing key) =="
+          KS=""
+          for c in "$HOME/.android/debug.keystore" "$ANDROID_HOME/.android/debug.keystore" "$ANDROID_SDK_HOME/.android/debug.keystore" "${ANDROID_USER_HOME:-$HOME/.android}/debug.keystore"; do
+            [ -f "$c" ] && KS="$c" && break
+          done
+          echo "debug keystore: ${KS:-NOT FOUND}"
+          JS="$(command -v jarsigner || true)"
+          [ -z "$JS" ] && JS="$(dirname "$(command -v java)")/jarsigner"
+          [ -x "$JS" ] || JS="$JAVA_HOME/bin/jarsigner"
+          SIGNED="$APK.signed"
+          "$JS" -keystore "$KS" -storepass android -keypass android \
+            -sigalg SHA256withRSA -digestalg SHA256 \
+            -signedjar "$SIGNED" "$APK" androiddebugkey
+          mv -f "$SIGNED" "$APK"
+          echo "== Re-signed APK =="
+          ls -la "$APK"
+
       - name: Generate changelog & tag
         id: clog
         if: steps.guard.outputs.skip != 'true'
@@ -128,6 +168,7 @@ jobs:
             echo "- **版本**: \`$VERSION\`"
             echo "- **构建时间**: $BUILDTIME"
             echo "- **产物**: \`$APKNAME\`"
+            echo "- **桌面 hook**: 已内置 \`libhyperceiler_home.so\`（桌面底栏功能，经 \`META-INF/xposed/native_init.list\` 注册）"
             echo ""
             echo "### 相对上次夜版的改动"
             echo ""
@@ -145,6 +186,7 @@ jobs:
             echo "- **Version**: \`$VERSION\`"
             echo "- **Build time**: $BUILDTIME"
             echo "- **Artifact**: \`$APKNAME\`"
+            echo "- **Desktop dock hook**: \`libhyperceiler_home.so\` bundled (desktop bottom-bar features, registered via \`META-INF/xposed/native_init.list\`)"
             echo ""
             echo "### Changes since last nightly"
             echo ""
