@@ -139,7 +139,16 @@ jobs:
           fi
           echo "apksigner: $APKSIGNER"
           SIGNED="$APK.signed"
+          # v2/v3-only: v1 signing rewrites the whole zip and re-aligns every
+          # entry to 4 bytes (apkzlib default), destroying our 4096-byte .so
+          # alignment -> install fails with "Failed to extract native
+          # libraries, res=-2". v2/v3 signing only prepends the signing block
+          # before the central directory, so entry offsets are untouched.
+          # minSdk>=24 (AGP build has no v1 entries either), so v2-only is valid.
           "$APKSIGNER" sign \
+            --v1-signing-enabled false \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
             --ks "$KS" --ks-key-alias androiddebugkey \
             --ks-pass pass:android --key-pass pass:android \
             --out "$SIGNED" "$APK"
