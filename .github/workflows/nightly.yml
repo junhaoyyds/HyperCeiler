@@ -110,7 +110,7 @@ jobs:
           #   (required when extractNativeLibs is false, else install fails with
           #   "Failed to extract native libraries, res=-2")
           # - injects META-INF/xposed/native_init.list = libhyperceiler_home.so
-          # - strips stale v1 signatures so jarsigner regenerates them
+          # - strips stale v1 signatures so apksigner regenerates them
           python3 "${{ github.workspace }}/.github/scripts/align_final.py" "$APK" "$APK.aligned"
           mv -f "$APK.aligned" "$APK"
 
@@ -129,13 +129,21 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
           fi
           echo "debug keystore: $KS"
-          JS="$(command -v jarsigner || true)"
-          [ -z "$JS" ] && JS="$(dirname "$(command -v java)")/jarsigner"
-          [ -x "$JS" ] || JS="$JAVA_HOME/bin/jarsigner"
+          # MUST use apksigner (v1+v2 scheme). jarsigner only produces a v1
+          # signature, which Android 11+ rejects for targetSdk>=30 apps
+          # (surfaces as "Failed to extract native libraries, res=-2").
+          APKSIGNER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name apksigner -type f 2>/dev/null | sort | tail -n1)"
+          if [ -z "$APKSIGNER" ]; then
+            echo "apksigner not found in build-tools, listing sdk:"; ls -la "${ANDROID_HOME:-}" 2>/dev/null || true
+            exit 1
+          fi
+          echo "apksigner: $APKSIGNER"
           SIGNED="$APK.signed"
-          "$JS" -keystore "$KS" -storepass android -keypass android \
-            -sigalg SHA256withRSA -digestalg SHA256 \
-            -signedjar "$SIGNED" "$APK" androiddebugkey
+          "$APKSIGNER" sign \
+            --ks "$KS" --ks-key-alias androiddebugkey \
+            --ks-pass pass:android --key-pass pass:android \
+            --out "$SIGNED" "$APK"
+          "$APKSIGNER" verify --print-certs "$SIGNED" || true
           mv -f "$SIGNED" "$APK"
           echo "== Re-signed APK =="
           ls -la "$APK"
