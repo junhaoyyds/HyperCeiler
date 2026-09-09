@@ -102,11 +102,12 @@ jobs:
       - name: Inject desktop dock hook (native_init.list) and re-sign with nightly debug key
         if: steps.guard.outputs.skip != 'true'
         run: |
+          set -euo pipefail
           APK="${{ steps.apk.outputs.path }}"
           echo "== Inject desktop dock hook into $APK =="
-          python3 - <<'PY'
-          import zipfile, os
-          apk = os.environ["APK"]
+          python3 - "$APK" <<'PY'
+          import zipfile, sys, os
+          apk = sys.argv[1]
           tmp = apk + ".inject.tmp"
           src = zipfile.ZipFile(apk)
           entries = [(i.filename, src.read(i.filename)) for i in src.infolist()
@@ -127,7 +128,16 @@ jobs:
           for c in "$HOME/.android/debug.keystore" "$ANDROID_HOME/.android/debug.keystore" "$ANDROID_SDK_HOME/.android/debug.keystore" "${ANDROID_USER_HOME:-$HOME/.android}/debug.keystore"; do
             [ -f "$c" ] && KS="$c" && break
           done
-          echo "debug keystore: ${KS:-NOT FOUND}"
+          if [ -z "$KS" ]; then
+            echo "debug keystore not found; generating standard AGP debug keystore"
+            KS="$HOME/.android/debug.keystore"
+            mkdir -p "$(dirname "$KS")"
+            keytool -genkeypair -v -keystore "$KS" -alias androiddebugkey \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
+          fi
+          echo "debug keystore: $KS"
           JS="$(command -v jarsigner || true)"
           [ -z "$JS" ] && JS="$(dirname "$(command -v java)")/jarsigner"
           [ -x "$JS" ] || JS="$JAVA_HOME/bin/jarsigner"
