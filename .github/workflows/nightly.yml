@@ -110,18 +110,56 @@ jobs:
           apk = sys.argv[1]
           tmp = apk + ".inject.tmp"
           src = zipfile.ZipFile(apk)
-          entries = [(i.filename, src.read(i.filename)) for i in src.infolist()
-                     if i.filename != "META-INF/xposed/native_init.list"]
-          with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
-              for name, data in entries:
-                  out.writestr(name, data)
-              out.writestr("META-INF/xposed/native_init.list", "libhyperceiler_home.so\n")
+          with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as out:
+              for it in src.infolist():
+                  fn = it.filename
+                  # Drop stale v1/v2/v3 signatures; jarsigner regenerates them.
+                  if fn.startswith("META-INF/"):
+                      b = fn.rsplit("/", 1)[-1]
+                      if b.endswith((".SF", ".RSA", ".DSA", ".EC")) or b == "MANIFEST.MF":
+                          continue
+                  if fn == "META-INF/xposed/native_init.list":
+                      continue  # re-added below with correct content
+                  data = src.read(fn)
+                  zi = zipfile.ZipInfo(fn, it.date_time)
+                  zi.compress_type = it.compress_type      # PRESERVE original (so .so stay STORED)
+                  zi.external_attr = it.external_attr
+                  zi.internal_attr = it.internal_attr
+                  zi.create_system = it.create_system
+                  zi.extract_version = it.extract_version
+                  zi._raw_time = it._raw_time
+                  zi.extra = it.extra
+                  out.compression = it.compress_type
+                  out.writestr(zi, data)
+              # Inject desktop dock hook registration (must be uncompressed)
+              ni = zipfile.ZipInfo("META-INF/xposed/native_init.list", (1980, 1, 1, 0, 0, 0))
+              ni.compress_type = zipfile.ZIP_STORED
+              ni.external_attr = 0o644 << 16
+              out.compression = zipfile.ZIP_STORED
+              out.writestr(ni, b"libhyperceiler_home.so\n")
+          src.close()
           os.replace(tmp, apk)
           with zipfile.ZipFile(apk) as z:
               assert "META-INF/xposed/native_init.list" in z.namelist(), "native_init.list missing!"
               assert "lib/arm64-v8a/libhyperceiler_home.so" in z.namelist(), "home.so missing!"
+              for n in z.namelist():
+                  if n.endswith(".so"):
+                      assert z.getinfo(n).compress_type == zipfile.ZIP_STORED, \
+                          f"{n} must be STORED (uncompressed), got {z.getinfo(n).compress_type}"
               print("OK native_init.list =>", z.read("META-INF/xposed/native_init.list").decode().strip())
+              print("OK all .so are STORED (uncompressed, install-safe)")
           PY
+
+          # 4KB-align stored entries (best practice for extractNativeLibs). Harmless if zipalign missing.
+          ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
+          ZA="$(find "$ANDROID_HOME/build-tools" -name zipalign 2>/dev/null | head -n1)"
+          [ -x "$ZA" ] || ZA="$(command -v zipalign || true)"
+          if [ -n "$ZA" ]; then
+            ALIGNED="$APK.aligned"
+            if "$ZA" -p 4 "$APK" "$ALIGNED"; then mv -f "$ALIGNED" "$APK"; echo "zipalign done"; else echo "zipalign failed; keeping unaligned (still install-safe)"; fi
+          else
+            echo "zipalign not found; .so are STORED (install-safe)"
+          fi
 
           echo "== Re-sign with runner debug keystore (== nightly signing key) =="
           KS=""
