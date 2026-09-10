@@ -99,63 +99,13 @@ jobs:
           echo "path=$APK" >> "$GITHUB_OUTPUT"
           echo "name=$(basename "$APK")" >> "$GITHUB_OUTPUT"
 
-      - name: Inject desktop dock hook (native_init.list) + 4KB-align .so + re-sign
-        if: steps.guard.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          APK="${{ steps.apk.outputs.path }}"
-          echo "== Repack (inject native_init.list + 4KB-align STORED .so) =="
-          # align_final.py: pure-python, no external zipalign needed.
-          # - preserves every entry's content, forces STORED .so to 4KB page-aligned
-          #   (required when extractNativeLibs is false, else install fails with
-          #   "Failed to extract native libraries, res=-2")
-          # - injects META-INF/xposed/native_init.list = libhyperceiler_home.so
-          # - strips stale v1 signatures so apksigner regenerates them
-          python3 "${{ github.workspace }}/.github/scripts/align_final.py" "$APK" "$APK.aligned"
-          mv -f "$APK.aligned" "$APK"
-
-          echo "== Re-sign with runner debug keystore (== nightly signing key) =="
-          KS=""
-          for c in "$HOME/.android/debug.keystore" "${ANDROID_HOME:-}/.android/debug.keystore" "${ANDROID_SDK_HOME:-}/.android/debug.keystore" "${ANDROID_USER_HOME:-$HOME/.android}/debug.keystore"; do
-            [ -f "$c" ] && KS="$c" && break
-          done
-          if [ -z "$KS" ]; then
-            echo "debug keystore not found; generating standard AGP debug keystore"
-            KS="$HOME/.android/debug.keystore"
-            mkdir -p "$(dirname "$KS")"
-            keytool -genkeypair -v -keystore "$KS" -alias androiddebugkey \
-              -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass android -keypass android \
-              -dname "CN=Android Debug,O=Android,C=US" 2>/dev/null || true
-          fi
-          echo "debug keystore: $KS"
-          # MUST use apksigner (v1+v2 scheme). jarsigner only produces a v1
-          # signature, which Android 11+ rejects for targetSdk>=30 apps
-          # (surfaces as "Failed to extract native libraries, res=-2").
-          APKSIGNER="$(find "${ANDROID_HOME:-/usr/local/lib/android/sdk}/build-tools" -name apksigner -type f 2>/dev/null | sort | tail -n1)"
-          if [ -z "$APKSIGNER" ]; then
-            echo "apksigner not found in build-tools, listing sdk:"; ls -la "${ANDROID_HOME:-}" 2>/dev/null || true
-            exit 1
-          fi
-          echo "apksigner: $APKSIGNER"
-          SIGNED="$APK.signed"
-          # v2/v3-only: v1 signing rewrites the whole zip and re-aligns every
-          # entry to 4 bytes (apkzlib default), destroying our 4096-byte .so
-          # alignment -> install fails with "Failed to extract native
-          # libraries, res=-2". v2/v3 signing only prepends the signing block
-          # before the central directory, so entry offsets are untouched.
-          # minSdk>=24 (AGP build has no v1 entries either), so v2-only is valid.
-          "$APKSIGNER" sign \
-            --v1-signing-enabled false \
-            --v2-signing-enabled true \
-            --v3-signing-enabled true \
-            --ks "$KS" --ks-key-alias androiddebugkey \
-            --ks-pass pass:android --key-pass pass:android \
-            --out "$SIGNED" "$APK"
-          "$APKSIGNER" verify --print-certs "$SIGNED" || true
-          mv -f "$SIGNED" "$APK"
-          echo "== Re-signed APK =="
-          ls -la "$APK"
+      # Desktop dock hook ships via source now:
+      # - lib/arm64-v8a/libhyperceiler_home.so  <- app/src/main/jniLibs/
+      # - META-INF/xposed/native_init.list      <- library/libhook/src/main/resources/META-INF/xposed/
+      # AGP packages both natively (correct 4KB alignment + v2 signing),
+      # so no post-build repack/re-sign is needed here. Post-build zip
+      # rewriting (python or apksigner) realigns entries to 4 bytes and
+      # breaks native lib extraction ("res=-2") — do not reintroduce it.
 
       - name: Generate changelog & tag
         id: clog
