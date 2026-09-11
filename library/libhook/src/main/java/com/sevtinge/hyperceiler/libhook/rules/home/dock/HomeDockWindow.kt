@@ -1,4 +1,21 @@
-/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/*
+  * This file is part of HyperCeiler.
+
+  * HyperCeiler is free software: you can redistribute it and/or modify
+  * it under the terms of the GNU Affero General Public License as
+  * published by the Free Software Foundation, either version 3 of the
+  * License.
+
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU Affero General Public License for more details.
+
+  * You should have received a copy of the GNU Affero General Public License
+  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+  * Copyright (C) 2023-2026 HyperCeiler Contributions
+*/
 package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
 import android.content.SharedPreferences
@@ -9,6 +26,7 @@ import android.graphics.Rect
 import android.os.Handler
 import android.os.Bundle
 import android.os.IBinder
+import android.os.Looper
 import android.os.Parcel
 import android.os.SystemClock
 import android.provider.Settings
@@ -25,6 +43,7 @@ import io.github.lingqiqi5211.ezhooktool.xposed.dsl.createBeforeHook
 import io.github.lingqiqi5211.ezhooktool.xposed.dsl.getObjectFieldAs
 import java.util.IdentityHashMap
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * HYOS launcher has no ART Activity: its Java module entry and JNI preference setter do not run.
@@ -44,6 +63,10 @@ class HomeDockWindow : BaseHook() {
         const val SET_CROP = "setWindowCrop"
         const val SET_RADIUS = "setCornerRadius"
         const val TRANSACTION = "android.view.SurfaceControl\$Transaction"
+        const val STALE_FRAME_NS = 50_000_000L
+        const val NATIVE_BIND_SWEEP_MS = 1_000L
+        /** Reveal (821ms) plus a margin for the keyguard/home wallpaper swap to settle. */
+        const val MATERIAL_SETTLE_MS = 1_600L
     }
     private object Surfaces {
         fun buildLayer(name: String, parent: Any, color: Boolean): Any {
@@ -101,69 +124,160 @@ class HomeDockWindow : BaseHook() {
         val motion: DockRecentsMotion = DockRecentsMotion(),
         val nativeMotion: DockNativeMotion = DockNativeMotion(),
         var nativeUid: Int = -1, var nativePid: Int = -1,
-        var nativeApplied: Boolean = false, var overview: Boolean = false, var editMode: Boolean = false,
-        var nativeEditState: Int = -1,
+        var nativeApplied: Boolean = false, var overview: Boolean = false,
         var nativeScene: Int = -1,
+        var overviewGeneration: Long = 0, var nativeOverviewGeneration: Long = 0,
+        var lastOverviewValidationNs: Long = 0,
         var lastVisible: Boolean? = null,
         var lastGlassReady: Boolean? = null,
         var motionSession: Any? = null, var motionClient: IBinder? = null,
         var motionSamples: Int = 0, var motionEndPending: Boolean = false,
         var baseY: Int = 0, var density: Float = 0f, var motionTime: Long = 0,
-        var x: Float = Float.NaN, var y: Float = Float.NaN)
+        var nativeSampleDeadlineNs: Long = 0,
+        var x: Float = Float.NaN, var y: Float = Float.NaN,
+        val reveal: DockUnlockReveal = DockUnlockReveal(),
+        var width: Int = 0, var height: Int = 0,
+        var revealScale: Float = 1f, var revealAlpha: Float = 1f) {
+        /** Drop every cached native identity/sample after the launcher Session changed. */
+        fun resetNativeMotion() {
+            nativeMotion.reset()
+            nativeApplied = false
+            nativeScene = -1
+            nativeSampleDeadlineNs = 0
+            motionSamples = 0
+            motionEndPending = false
+            nativeUid = -1
+            nativePid = -1
+        }
+    }
     private val layers = IdentityHashMap<Any, Layer>()
     private val observed = HashSet<String>()
     @Volatile private var stopped = false
     @Volatile private var settings = Settings.read()
     @Volatile private var service: Any? = null
     private var blurAvailable = true
+    private var revealScalingAvailable = true
+    // Protected by WM_LOCK, then layers. Covers a Dock created by the unlock traversal itself.
+    private var pendingRevealAt = -1L
+
+    // TODO(twitch-diag): temporary - true for 3s after each unlock so the post-reveal write
+    // sequence (which writer moves the dock when) can be traced; remove once the twitch is fixed.
+    private fun revealDebugActive(): Boolean =
+        pendingRevealAt >= 0L && SystemClock.uptimeMillis() - pendingRevealAt <= 3000L
+
+    // TODO(twitch-diag): rate limit for the temporary frame-write trace.
+    private var lastFrameDbgUptime = 0L
+
+    /**
+     * Whether the unlock's wallpaper-swap settle window is active.
+     *
+     * While the keyguard and home wallpapers differ, the transition swaps them, which flips the
+     * glass darkness probe and would tear the material down and rebuild it mid-transition - the
+     * flash the user sees as "sampling two different wallpapers". During this window the dock
+     * keeps its current material (and the reveal's fade-in hides most of that period anyway);
+     * exactly one rebuild is allowed once the window closes.
+     */
+    private fun materialSettleActive(): Boolean =
+        pendingRevealAt >= 0L && SystemClock.uptimeMillis() - pendingRevealAt <= MATERIAL_SETTLE_MS
     private var commandSamples = 0
     private val processGuard = DockGlassProcessGuard()
     private val glassClient = DockGlassClient(processGuard) { requestTraversal() }
-    private val nativeMotionEndpoint = DockNativeMotionEndpoint({
-        if (directMotionAvailable) scheduleAnimationFrame() else requestTraversal()
-    }, glassClient::record)
-    private val frameScheduled = AtomicBoolean(false)
+    private val nativeMotionEndpoint = DockNativeMotionEndpoint(
+        {
+            if (directMotionAvailable) scheduleAnimationFrame(true) else {
+                requestTraversal()
+                scheduleDirectMotionRecovery()
+            }
+        },
+        {
+            // Native's idle packet does not refresh motion state. It only proves transport
+            // liveness and exercises our dedicated frame receiver before the next gesture.
+            if (directMotionAvailable) scheduleAnimationFrame() else scheduleDirectMotionRecovery()
+        },
+        glassClient::record)
+    private val nativeMotionReply = ThreadLocal<Int>()
+    private data class FrameClock(val choreographer: Choreographer, val owned: Boolean)
+    private data class ScheduledFrame(val epoch: Long, val clock: FrameClock,
+        val callback: Choreographer.FrameCallback)
+    /** One background transform for one frame. Scale and alpha are 1 unless the reveal is live. */
+    private data class FrameUpdate(val layer: Layer, val y: Float, val scale: Float, val alpha: Float)
+    private val frameEpoch = AtomicLong(0)
+    private val scheduledFrameEpoch = AtomicLong(0)
+    private val scheduledFrameStartedNs = AtomicLong(0)
+    private val urgentFrameRecoveryScheduled = AtomicBoolean(false)
+    private val directRecoveryScheduled = AtomicBoolean(false)
+    private val nativeBindSweepScheduled = AtomicBoolean(false)
     @Volatile private var animationAvailable = true
     @Volatile private var directMotionAvailable = true
-    @Volatile private var animationChoreographer: Choreographer? = null
     // Owned and used only on WMS's handler thread, never the host window transaction.
+    private var animationFrameClock: FrameClock? = null
     private var motionTransaction: Any? = null
-    private val animationFrame = Choreographer.FrameCallback { frameTimeNanos ->
-        frameScheduled.set(false)
-        if (!stopped) {
-            if (directMotionAvailable) updateMotionFrame(frameTimeNanos) else requestTraversal()
-        }
-    }
+    private var scheduledFrame: ScheduledFrame? = null
+    private var directRecoveryDelay = 100L
 
     override fun init() {
-        glassClient.record("hook init diagnosticVersion=25 enabled=${settings.enabled} mode=${settings.mode}")
+        refreshSettings()
+        glassClient.record("hook init diagnosticVersion=32 enabled=${settings.enabled} mode=${settings.mode}")
         runCatching { processGuard.install() }
             .onFailure { glassClient.record("renderer guard unavailable=${it.javaClass.simpleName}") }
         val prefs = PrefsBridge.getSharedPreferences()
         val listener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
             if (key == null || key.contains("home_dock_") || key.endsWith("home_other_home_mode")) {
-                runCatching { settings = Settings.read(); requestTraversal() }
-                    .onFailure { failClosed(it) }
+                // Advisory only. The callback now tells us when it is worth redrawing, it is no
+                // longer what makes a value visible: the sweep and every traversal read the
+                // preferences themselves. Refresh first so the requested traversal cannot see the
+                // previous value, and never fail the hook closed over a read.
+                refreshSettings()
+                requestTraversal()
             }
         }
-        prefs.registerOnSharedPreferenceChangeListener(listener)
+        prefs?.registerOnSharedPreferenceChangeListener(listener)
         registerHotReloadCleanup {
             stopped = true
-            prefs.unregisterOnSharedPreferenceChangeListener(listener)
+            prefs?.unregisterOnSharedPreferenceChangeListener(listener)
             synchronized(layers) { layers.keys.toList().forEach { removeLayer(it) } }
             glassClient.close()
             processGuard.close()
             service?.getObjectFieldAs<Handler>(WM_HANDLER)?.post {
-                runCatching { animationChoreographer?.removeFrameCallback(animationFrame) }
+                cancelScheduledFrame()
                 runCatching { motionTransaction?.callMethod("close") }
                 motionTransaction = null
-                animationChoreographer = null
-                frameScheduled.set(false)
+                retireFrameClock()
+                directRecoveryScheduled.set(false)
+                nativeBindSweepScheduled.set(false)
             }
         }
-        // Auto-hide comes from the launcher's dynamically resolved native EditMode state.
         WindowHooks(loadClass("com.android.server.wm.WindowState")).install()
+        installUnlockReveal()
         XposedLog.i(TAG, LOG_TAG, "WMS dock hook ready: enabled=${settings.enabled}, blur=${settings.blur}")
+    }
+
+    /**
+     * Re-read every dock preference and publish the new values to [settings].
+     *
+     * The launcher is drawn by WMS, so restarting the desktop does not re-create this hook - it
+     * only re-creates the launcher's WindowState. The snapshot taken at hook init is therefore
+     * *not* refreshed by a desktop restart, and the remote preference map only advances when the
+     * framework pushes an update into this process. Whenever that push is lost - LSPosed shipped a
+     * dedicated fix for exactly this on system_server - the geometry stayed pinned to whatever was
+     * current when system_server loaded the module. That is the reported "I changed the height,
+     * restarted the desktop, nothing happened", while a local test that happened to keep the
+     * update path alive appeared to work.
+     *
+     * Reading here is cheap (a handful of in-memory lookups on the remote map) and every caller is
+     * already doing far more expensive work - one is a full layout pass. A failed read keeps the
+     * last known-good values rather than failing the hook closed: a stale dock is strictly better
+     * than no dock.
+     *
+     * @return true when at least one value actually changed.
+     */
+    private fun refreshSettings(): Boolean {
+        val latest = runCatching { Settings.read() }.getOrNull() ?: return false
+        if (latest == settings) return false
+        settings = latest
+        glassClient.record("prefs applied enabled=${latest.enabled} mode=${latest.mode} " +
+            "height=${latest.height} margin=${latest.margin} bottom=${latest.bottom} radius=${latest.radius}")
+        return true
     }
 
     /** Keeps optional scene-hook failures separate from the background's lifecycle. */
@@ -193,8 +307,10 @@ class HomeDockWindow : BaseHook() {
                         if (code != DockNativeMotionEndpoint.TRANSACTION_CODE) return@createBeforeHook
                         val data = param.args[1] as Parcel
                         val position = data.dataPosition()
+                        nativeMotionReply.remove()
                         runCatching {
-                            nativeMotionEndpoint.receive(code, data, param.args[3] as Int)
+                            nativeMotionReply.set(
+                                nativeMotionEndpoint.receive(code, data, param.args[3] as Int))
                         }.onFailure {
                             if (observed.add("native-motion-transaction-error")) {
                                 glassClient.record("native motion transaction rejected=${it.javaClass.simpleName}")
@@ -209,9 +325,11 @@ class HomeDockWindow : BaseHook() {
                     }
                     // The original Stub sees an unknown private code. Confirm it only after all
                     // before callbacks have had a chance to consume the restored input Parcel.
-                    val reply = param.args[2] as Parcel
+                    val acknowledgment = nativeMotionReply.get() ?: DockNativeMotionEndpoint.ACK
+                    nativeMotionReply.remove()
+                    val reply = param.args[2] as? Parcel ?: return@createAfterHook
                     reply.setDataPosition(0)
-                    reply.writeInt(DockNativeMotionEndpoint.ACK)
+                    reply.writeInt(acknowledgment)
                     param.result = true
                 }
                 glassClient.record("native motion IWindowManager endpoint ready")
@@ -224,6 +342,10 @@ class HomeDockWindow : BaseHook() {
             if (stopped) return
             val attrs = attrsField.get(window) as WindowManager.LayoutParams
             if (attrs.packageName != "com.miui.home") return
+            // Only launcher windows reach this point, so this is the cheapest place to pick up a
+            // changed parameter. It is what makes an edit survive a desktop restart: the restart
+            // rebuilds the WindowState and traverses into here, but it never re-creates the hook.
+            refreshSettings()
             val title = attrs.title.toString()
             synchronized(layers) {
                 if (stopped) return
@@ -234,6 +356,7 @@ class HomeDockWindow : BaseHook() {
                 service = window.getObjectFieldAs<Any>("mWmService")
                 if (settings.enabled) glassClient.bindDiagnostics(service!!.getObjectFieldAs<Context>("mContext"))
                 updateLayer(window)
+                scheduleNativeBindSweep()
             }
         }
 
@@ -299,7 +422,7 @@ class HomeDockWindow : BaseHook() {
                     synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
                         synchronized(layers) {
                             val layer = layers[window] ?: return@postDelayed
-                            if (stopped || layer.editMode) return@postDelayed
+                            if (stopped) return@postDelayed
                             val nativeLatest = nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid)
                             if (layer.overview || nativeLatest != null) return@postDelayed
                             if (!layer.nativeApplied && window.callMethod("isVisible") == true) {
@@ -334,12 +457,20 @@ class HomeDockWindow : BaseHook() {
             val targetChanged = layer.motion.setOverview(overview, now)
             if (immediate) layer.motion.finish()
             val nativeLatest = nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid)
+            val validationNow = System.nanoTime()
+            if (overview && validationNow - layer.lastOverviewValidationNs > 80_000_000L) {
+                layer.lastOverviewValidationNs = validationNow
+                layer.overviewGeneration++
+                val alreadyObserved = nativeMotionEndpoint.sawOverviewSince(
+                    layer.nativeUid, layer.nativePid, validationNow - 100_000_000L)
+                scheduleNativeHookValidation(window, layer, layer.overviewGeneration,
+                    layer.nativeUid, layer.nativePid, validationNow, alreadyObserved)
+            }
             if (nativeLatest != null) {
                 if (targetChanged || (immediate && wasRunning)
                     || layer.nativeScene == 1
                     || (layer.overview && layer.nativeScene == 0)) {
-                    scheduleAnimationFrame()
-                    scheduleNativeExpiryCheck()
+                    scheduleAnimationFrame(true)
                 }
                 return
             }
@@ -354,6 +485,35 @@ class HomeDockWindow : BaseHook() {
             }
         }
 
+        private fun scheduleNativeHookValidation(window: Any, expectedLayer: Layer,
+            generation: Long, expectedUid: Int, expectedPid: Int,
+            since: Long, alreadyObserved: Boolean) {
+            val wm = service ?: return
+            wm.getObjectFieldAs<Handler>(WM_HANDLER).postDelayed({
+                runCatching {
+                    synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
+                        synchronized(layers) {
+                            val layer = layers[window] ?: return@postDelayed
+                            if (stopped || layer !== expectedLayer
+                                || layer.overviewGeneration != generation
+                                || layer.nativeUid != expectedUid || layer.nativePid != expectedPid) {
+                                return@postDelayed
+                            }
+                            if (alreadyObserved || nativeMotionEndpoint.sawOverviewSince(
+                                    expectedUid, expectedPid, since)) {
+                                layer.nativeOverviewGeneration = generation
+                                return@postDelayed
+                            }
+                            nativeMotionEndpoint.requestHookRevalidation(
+                                expectedUid, expectedPid)
+                            glassClient.record(
+                                "native motion missing after overview target; requesting semantic revalidation")
+                        }
+                    }
+                }.onFailure { reportMotionError(it) }
+            }, 250)
+        }
+
         private fun reportMotionError(error: Throwable) {
             synchronized(layers) {
                 if (observed.add("recents-motion-error")) {
@@ -365,7 +525,12 @@ class HomeDockWindow : BaseHook() {
     }
 
     private inner class LayerUpdate {
+
         fun update(window: Any) {
+            // Already re-read by prepareWindow (every launcher traversal) and by the 1 Hz sweep,
+            // so this is the live configuration rather than the value captured at hook init.
+            // Nothing below caches it across traversals: changing a parameter and re-laying the
+            // window always recomputes the bounds from the current values.
             val config = settings
             if (!config.enabled) { removeLayer(window); return }
             val parent = window.callMethod("getSurfaceControl") ?: return
@@ -376,17 +541,34 @@ class HomeDockWindow : BaseHook() {
                 config.height, config.margin, config.bottom, config.radius)
             if (bounds == null) { removeLayer(window); return }
             val layer = obtainLayer(window, parent, frame, bounds, config)
+            // The reveal scales about the layer's own centre, so the bounds have to be current.
+            layer.width = bounds.width()
+            layer.height = bounds.height()
             val dark = when (config.nightMode) {
                 1 -> false
                 2 -> true
                 else -> configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
             }
             val windowVisible = window.callMethod("isVisible") == true
-            val visible = windowVisible && !layer.editMode
-            bindNativeMotion(layer)
-            if ((!visible && !layer.nativeApplied) || (!animationAvailable && !layer.nativeApplied)) layer.motion.finish()
+            val visible = windowVisible
+            bindNativeMotion(window, layer)
+            if (!visible) {
+                layer.motion.finish()
+                layer.nativeMotion.reset()
+                layer.nativeApplied = false
+                layer.nativeScene = -1
+                layer.nativeSampleDeadlineNs = 0
+            } else if (!animationAvailable && !layer.nativeApplied) {
+                layer.motion.finish()
+            }
             val glass = updateGlass(layer, config, bounds, dark, visible)
-            if (visible && layer.lastVisible == false && glass != null) glassClient.resume(glass)
+            if (visible && layer.lastVisible == false && glass != null) {
+                // During the settle window an unhealthy probe must not drop the dock to the
+                // compositor fallback: the wallpaper swap makes the producer transiently busy,
+                // and a fallback/native round-trip right there is exactly the flash to avoid.
+                // The post-settle traversal re-runs resume with fallbacks enabled.
+                glassClient.resume(glass, allowFallback = !materialSettleActive())
+            }
             if (!visible && layer.lastVisible == true && glass != null) glassClient.pauseRefresh(glass)
             layer.lastVisible = visible
             val appearance = Appearance(config, bounds, dark, visible, glass)
@@ -404,8 +586,12 @@ class HomeDockWindow : BaseHook() {
             // WMS still initializes/repositions our layer when the actual layout changes.
             val movingDirectly = directMotionAvailable && visible && running
             val keepDirectPosition = movingDirectly && !geometryChanged
+            // The reveal offset MUST ride along here too: while a reveal is running the frame loop
+            // writes baseY+offset+risePx every vsync, and a traversal writing the bare resting y
+            // would fight it at display rate - the dock visibly vibrating between two positions.
+            // With the same formula both writers agree, so traversal writes become no-ops.
             val y = if (keepDirectPosition) layer.y
-                else bounds.y() + offset
+                else bounds.y() + offset + layer.reveal.risePx(layer.density, now)
             if (visible && running) scheduleAnimationFrame()
             val moved = layer.x != x || layer.y != y
             if (!moved && layer.appearance == appearance.key) return
@@ -413,9 +599,18 @@ class HomeDockWindow : BaseHook() {
             if (moved) {
                 // Move the common parent: glass, tint and fallback blur stay aligned. The size/key
                 // remains unchanged, so a frame of motion never recreates the glass host or texture.
-                transaction.callMethod(SET_POSITION, layer.effect, x, y)
+                // The reveal's pivot compensation rides along, otherwise a traversal landing
+                // mid-reveal would drop it and visibly shift the dock.
+                val shift = pivotOffset(layer.revealScale)
+                transaction.callMethod(SET_POSITION, layer.effect,
+                    x + layer.width * shift, y + layer.height * shift)
                 layer.x = x
                 layer.y = y
+                // TODO(twitch-diag): trace traversal writes right after an unlock.
+                if (revealDebugActive()) {
+                    glassClient.record("reveal dbg layout yOff=${y - layer.baseY} " +
+                        "rise=${layer.reveal.risePx(layer.density, now)} revealScale=${layer.revealScale}")
+                }
                 recordMotion(layer, y, now, visible, "layout")
             }
             if (layer.appearance == appearance.key) return
@@ -425,14 +620,18 @@ class HomeDockWindow : BaseHook() {
 
         private fun updateGlass(layer: Layer, config: Settings, bounds: DockWindowPolicy.Bounds,
             dark: Boolean, visible: Boolean): DockGlassClient.Ticket? {
-            val glassKey = "${bounds.width()}/${bounds.height()}/${bounds.radius()}/$dark"
+            // Inside the wallpaper-swap settle window keep the existing ticket: releasing and
+            // rebuilding the glass while the keyguard and home wallpapers are swapping is the
+            // "samples two different wallpapers" flash. One rebuild happens after the window.
+            val settledDark = if (materialSettleActive() && layer.glass != null) layer.glass!!.dark else dark
+            val glassKey = "${bounds.width()}/${bounds.height()}/${bounds.radius()}/$settledDark"
             if (!config.glass || layer.glass?.key?.let { it != glassKey } == true) {
                 layer.glass?.let { glassClient.release(it) }
                 layer.glass = null
             }
             if (config.glass && visible && layer.glass == null) {
                 val context = service!!.getObjectFieldAs<Context>("mContext")
-                layer.glass = glassClient.create(context, glassKey, bounds, dark)
+                layer.glass = glassClient.create(context, glassKey, bounds, settledDark)
             }
             return layer.glass
         }
@@ -449,17 +648,35 @@ class HomeDockWindow : BaseHook() {
                 try { tint = Surfaces.buildLayer("HyperCeiler Dock tint", effect, true) }
                 finally { if (tint == null) Surfaces.destroySurface(effect) }
                 layer = Layer(parent, effect, tint)
+                val now = SystemClock.uptimeMillis()
+                if (DockUnlockReveal.acceptsPending(pendingRevealAt, now)) {
+                    layer.reveal.arm(pendingRevealAt)
+                    layer.reveal.startIfArmed(pendingRevealAt)
+                }
                 layers[window] = layer
                 val motionLayer = layer
-                runCatching {
-                    motionLayer.motionSession = window.getObjectFieldAs<Any>("mSession")
-                    motionLayer.motionClient = window.getObjectFieldAs<Any>("mClient").callMethod("asBinder") as IBinder
-                    glassClient.record("motion window identity bound")
-                }.onFailure {
-                    // An optional Session fallback must never disable the glass background.
-                    motionLayer.motionSession = null
-                    motionLayer.motionClient = null
-                    glassClient.record("motion window identity unavailable=${it.javaClass.simpleName}")
+                // Resolve the two identities independently. They used to share one
+                // runCatching, so a failure while reading mClient.asBinder() also threw
+                // away a perfectly good mSession, leaving this window with nativeUid/Pid
+                // = -1 forever: no native sample, no real-time follow, and only a desktop
+                // restart (which builds a new WindowState and layer) could recover.
+                runCatching { motionLayer.motionSession = window.getObjectFieldAs<Any>("mSession") }
+                    .onFailure {
+                        motionLayer.motionSession = null
+                        glassClient.record("motion window identity unavailable=${it.javaClass.simpleName}")
+                    }
+                if (motionLayer.motionSession != null) {
+                    runCatching {
+                        motionLayer.motionClient = window.getObjectFieldAs<Any>("mClient")
+                            .callMethod("asBinder") as IBinder
+                        glassClient.record("motion window identity bound")
+                    }.onFailure {
+                        // The client binder is only an optional Session fallback; the native
+                        // binding needs mSession's uid/pid alone. Never discard the session.
+                        motionLayer.motionClient = null
+                        glassClient.record(
+                            "motion window identity bound session-only=${it.javaClass.simpleName}")
+                    }
                 }
                 XposedLog.i(TAG, LOG_TAG, "Dock surface created: frame=$frame, bounds=$bounds, blur=${config.blur}")
                 if (!config.blur && Color.alpha(config.color) == 0) {
@@ -503,6 +720,14 @@ class HomeDockWindow : BaseHook() {
                 if (glassReady && glass?.dead == false) 0f else Color.alpha(color) / 255f)
             transaction.callMethod("show", layer.tint)
             transaction.callMethod(if (visible) "show" else "hide", layer.effect)
+            // The layer can become visible before the reveal's first animation frame runs. Pose it
+            // inside this very transaction, otherwise the dock is drawn once at its resting size
+            // and only then flies in - the "shows first, animates after" artefact.
+            if (layer.reveal.isRunning()) {
+                applyRevealPose(transaction, layer, SystemClock.uptimeMillis())
+            } else if (layer.revealAlpha != 1f || layer.revealScale != 1f) {
+                restoreRestingTransform(transaction, layer)
+            }
             val appliedGlass = glassReady && glass?.dead == false
             if (config.glass && layer.lastGlassReady != appliedGlass) {
                 glassClient.record("glass applied native=$appliedGlass fallbackBlur=${if (appliedGlass) 0 else 120} visible=$visible")
@@ -515,22 +740,253 @@ class HomeDockWindow : BaseHook() {
     private val layerUpdate = LayerUpdate()
     private fun updateLayer(window: Any) { layerUpdate.update(window) }
 
-    private fun setEditMode(layer: Layer, enabled: Boolean, reason: String) {
-        if (layer.editMode == enabled) return
-        layer.editMode = enabled
-        glassClient.record("dock editMode=$enabled $reason")
-        // All visibility changes go through requestTraversal → applyAppearance
-        // using the window's sync transaction. Never create a separate transaction
-        // here — it races with the sync transaction and can leave the glass hidden.
-        requestTraversal()
-    }
-
     private fun removeLayer(window: Any) {
         val layer = layers.remove(window) ?: return
         layer.glass?.let { glassClient.release(it) }
         // Only release surfaces created by this hook. Never release the host's parent handle.
         runCatching { Surfaces.destroySurface(layer.tint) }
         runCatching { Surfaces.destroySurface(layer.effect) }
+    }
+
+    /**
+     * Start the dock reveal when the platform begins the unlock transition.
+     *
+     * `keyguardGoingAway` precedes Flutter _showPresent by roughly 20 ms in the reference trace.
+     * This aligns the local reveal's epoch, not each icon's independently staggered 3D transform.
+     * The existing native recents channel does not sample that Flutter unlock transform.
+     *
+     * Every failure is reported instead of thrown, because the dock must keep working without the
+     * reveal. A failed install only costs the animation.
+     */
+    private fun installUnlockReveal() {
+        // services.jar confirms keyguardGoingAway(int flags) on both classes. This is the
+        // transition START. setKeyguardShown(false) arrives ~315 ms after Flutter _showPresent
+        // on the reference device; it must not be used as an animation-start fallback.
+        val targets = listOf(
+            "com.android.server.wm.KeyguardController" to "keyguardGoingAway",
+            "com.android.server.wm.ActivityTaskManagerService" to "keyguardGoingAway"
+        )
+        for ((className, methodName) in targets) {
+            val type = runCatching { loadClass(className) }.getOrNull()
+            if (type == null) {
+                glassClient.record("unlock reveal class missing $className")
+                continue
+            }
+            val named = hierarchyDeclaredMethods(type).filter { it.name == methodName }
+            val method = named.firstOrNull { candidate ->
+                candidate.parameterTypes.contentEquals(arrayOf(Int::class.javaPrimitiveType))
+            }
+            if (method == null) {
+                glassClient.record("unlock reveal no int-flags signature $className#$methodName found=" +
+                    named.joinToString("|") { it.toGenericString().substringAfter("$className.") }.take(180))
+                continue
+            }
+            val hooked = runCatching {
+                method.isAccessible = true
+                method.createBeforeHook {
+                    if (stopped) return@createBeforeHook
+                    // No screen-state guard here, deliberately: `keyguardGoingAway` is only called
+                    // by KeyguardViewMediator once the unlock is authenticated (traced 14:12:
+                    // exactly one call per unlock, flags 8/18, never during AOD/doze transitions -
+                    // those go through setKeyguardShown instead). An isInteractive check would
+                    // REJECT fingerprint unlocks that go straight from doze to keyguard-gone,
+                    // killing the animation on the most common unlock path.
+                    onKeyguardGone()
+                }
+            }.isSuccess
+            if (hooked) {
+                glassClient.record(
+                    "unlock reveal trigger ready ${method.toGenericString()} phase=going-away")
+                return
+            }
+            glassClient.record("unlock reveal hook failed $className#$methodName")
+        }
+        glassClient.record("unlock reveal trigger unavailable")
+    }
+
+    /** Include inherited declarations: some ROMs keep these methods one level up. */
+    private fun hierarchyDeclaredMethods(type: Class<*>): List<java.lang.reflect.Method> {
+        val out = ArrayList<java.lang.reflect.Method>()
+        var current: Class<*>? = type
+        while (current != null && current != Any::class.java) {
+            out.addAll(current.declaredMethods)
+            current = current.superclass
+        }
+        return out
+    }
+
+    private fun onKeyguardGone() {
+        if (stopped || !settings.enabled) return
+        val wm = service ?: return
+        // This is a BEFORE hook: posting the arm to mH lets keyguard removal expose the resting
+        // Dock before the runnable executes. Prepare and commit the hidden pose before returning.
+        // Use the same lock order as traversal; WMS's global monitor is reentrant when already held.
+        runCatching {
+            var armed = 0
+            synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
+                synchronized(layers) {
+                    val now = SystemClock.uptimeMillis()
+                    if (!DockUnlockReveal.acceptsPending(pendingRevealAt, now)) {
+                        pendingRevealAt = now
+                    }
+                    layers.values.forEach {
+                        if (it.reveal.arm(now)) {
+                            // Keep the clock aligned with transition start even if WMS still
+                            // reports the launcher hidden for the first few animation frames.
+                            it.reveal.startIfArmed(now)
+                            armed++
+                        }
+                    }
+                    // Keep arm and prime atomic with respect to traversal and motion callbacks.
+                    if (armed > 0) primeReveal()
+                }
+            }
+            // Even with no existing layer, retain the event for obtainLayer and run the safety net.
+            glassClient.record("unlock reveal transition-start layers=$armed uptimeMs=$pendingRevealAt durationMs=${DockUnlockReveal.DURATION_MS}")
+            // Pose the layers now, so the frame where the dock first becomes visible is already
+            // the animation's first frame instead of one flash at the resting size.
+            if (directMotionAvailable) scheduleAnimationFrame(true) else {
+                requestTraversal()
+                scheduleDirectMotionRecovery()
+            }
+            // A reveal that never receives another frame must not leave the dock scaled,
+            // translucent - or, after priming, invisible. Restore the resting transform
+            // unconditionally once the whole window has elapsed.
+            wm.getObjectFieldAs<Handler>(WM_HANDLER)
+                .postDelayed({ resetStuckReveal() }, DockUnlockReveal.SETTLE_MS)
+            // Close the wallpaper-swap settle window: this traversal applies the home
+            // wallpaper's darkness in exactly one material rebuild, and re-probes the
+            // producer with fallbacks enabled in case it went unhealthy mid-transition.
+            wm.getObjectFieldAs<Handler>(WM_HANDLER)
+                .postDelayed({ requestTraversal() }, MATERIAL_SETTLE_MS + 100L)
+        }.onFailure {
+            glassClient.record("unlock reveal prepare failed=${it.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Scale our layer about its own origin.
+     *
+     * Only the four-float `setMatrix` exists on this ROM - there is no translation overload, and
+     * an earlier attempt to pass a pivot translation silently failed. The pivot is therefore
+     * handled by the caller, which offsets the position by half the layer times `1 - scale`.
+     */
+    private fun applyRevealScale(transaction: Any, layer: Layer, scale: Float) {
+        if (!revealScalingAvailable) return
+        runCatching {
+            transaction.callMethod("setMatrix", layer.effect, scale, 0f, 0f, scale)
+        }.onFailure {
+            revealScalingAvailable = false
+            glassClient.record("unlock reveal scaling unavailable ${it.javaClass.simpleName}" +
+                " msg=${it.message?.take(120)}; keeping the fade only")
+        }
+    }
+
+    /** Half of `1 - scale`, which is what a centre-anchored scale shifts the layer origin by. */
+    private fun pivotOffset(scale: Float): Float = (1f - scale) / 2f
+
+    /** Undo every trace of a reveal so a cancelled or superseded one cannot leave a residue. */
+    private fun restoreRestingTransform(transaction: Any, layer: Layer) {
+        applyRevealScale(transaction, layer, 1f)
+        transaction.callMethod("setAlpha", layer.effect, 1f)
+        layer.revealScale = 1f
+        layer.revealAlpha = 1f
+        if (layer.baseY > 0 && layer.x.isFinite()) {
+            val restY = layer.baseY + motionOffset(layer, SystemClock.uptimeMillis())
+            transaction.callMethod(SET_POSITION, layer.effect, layer.x, restY)
+            layer.y = restY
+            // TODO(twitch-diag): every restore is suspicious while investigating the twitch.
+            glassClient.record("reveal dbg restore yOff=${restY - layer.baseY}")
+        }
+    }
+
+    /**
+     * Write the reveal pose for [now] and remember it, so the frame loop does not repeat a write
+     * that is already on the surface.
+     *
+     * Shared by the prime at arm time and by the first visible appearance. The latter is what
+     * guarantees the dock is never drawn at its resting size: the pose travels in the same
+     * transaction that shows the layer.
+     */
+    private fun applyRevealPose(transaction: Any, layer: Layer, now: Long) {
+        val scale = layer.reveal.scale(now)
+        val alpha = layer.reveal.alpha(now)
+        applyRevealScale(transaction, layer, scale)
+        transaction.callMethod("setAlpha", layer.effect, alpha)
+        if (layer.baseY > 0 && layer.x.isFinite()) {
+            val restY = layer.baseY + motionOffset(layer, now) + layer.reveal.risePx(layer.density, now)
+            val shift = pivotOffset(scale)
+            transaction.callMethod(SET_POSITION, layer.effect,
+                layer.x + layer.width * shift, restY + layer.height * shift)
+            layer.y = restY
+        }
+        layer.revealScale = scale
+        layer.revealAlpha = alpha
+        // TODO(twitch-diag): called by prime and by applyAppearance (visibility flips) - rare.
+        glassClient.record("reveal dbg pose alpha=$alpha risePx=${layer.reveal.risePx(layer.density, now)}")
+    }
+
+    /**
+     * Put every layer into the reveal's first pose as soon as the reveal is armed.
+     *
+     * Most unlocks find the dock layer already built, but simply hidden behind the keyguard. Posing
+     * it here means that even if a traversal shows it before the frame loop's first pass, what
+     * becomes visible is already the first frame of the animation. Layers created later are caught
+     * by {@code applyAppearance}, which poses them in the transaction that shows them.
+     */
+    private fun primeReveal() {
+        val wm = service ?: return
+        if (stopped) return
+        runCatching {
+            synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
+                synchronized(layers) {
+                    if (layers.isEmpty()) return
+                    val transaction = motionTransaction ?: loadClass(TRANSACTION)
+                        .getConstructor().newInstance().also { motionTransaction = it }
+                    val now = SystemClock.uptimeMillis()
+                    layers.values.forEach { applyRevealPose(transaction, it, now) }
+                    transaction.callMethod("apply")
+                    glassClient.record("unlock reveal primed layers=${layers.size}")
+                }
+            }
+        }.onFailure {
+            glassClient.record("unlock reveal prime failed=${it.javaClass.simpleName}")
+        }
+    }
+
+    /**
+     * Safety net for a reveal whose frame source went away mid-flight.
+     *
+     * It runs after {@link DockUnlockReveal#SETTLE_MS}, but a timer scheduled by an earlier unlock
+     * can still land while a later one is animating, so each layer is asked whether its own reveal
+     * has stalled. Whatever is stalled and still holds a non-resting transform therefore lost its
+     * frames - including the case where the dock was primed and then never animated, which would
+     * otherwise leave it invisible forever.
+     */
+    private fun resetStuckReveal() {
+        val wm = service ?: return
+        if (stopped) return
+        runCatching {
+            synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
+                synchronized(layers) {
+                    val now = SystemClock.uptimeMillis()
+                    val stale = layers.values.filter {
+                        it.reveal.isStalled(now) && (it.revealScale != 1f || it.revealAlpha != 1f)
+                    }
+                    if (stale.isEmpty()) return
+                    val transaction = motionTransaction ?: loadClass(TRANSACTION)
+                        .getConstructor().newInstance().also { motionTransaction = it }
+                    stale.forEach {
+                        it.reveal.cancel()
+                        restoreRestingTransform(transaction, it)
+                    }
+                    transaction.callMethod("apply")
+                    glassClient.record("unlock reveal force reset layers=${stale.size}")
+                }
+            }
+        }.onFailure {
+            glassClient.record("unlock reveal reset failed=${it.javaClass.simpleName}")
+        }
     }
 
     private fun requestTraversal() {
@@ -557,65 +1013,129 @@ class HomeDockWindow : BaseHook() {
         }
     }
 
-    private fun updateMotionFrame(frameTimeNanos: Long) {
+    private fun updateMotionFrame(frameTimeNanos: Long, frameClock: FrameClock) {
         val wm = service ?: return
         runCatching {
             synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
                 synchronized(layers) {
                     if (stopped || !settings.enabled) return
                     var needsFrame = false
-                    val updates = ArrayList<Pair<Layer, Float>>()
+                    val frames = ArrayList<FrameUpdate>()
                     for ((window, layer) in layers) {
-                        if (window.callMethod("isVisible") != true || layer.effect.callMethod(IS_VALID) != true) {
-                            layer.motion.finish()
-                            continue
-                        }
+                        // Read the clock before the visibility test: an armed reveal still has to
+                        // expire while the launcher is briefly hidden behind a going-away keyguard.
                         val now = DockRecentsMotion.frameTimeMillis(frameTimeNanos, layer.motionTime)
                         layer.motionTime = now
-                        val y = layer.baseY + motionOffset(layer, now)
-                        if (!layer.nativeApplied && layer.motion.isRunning(now)) needsFrame = true
-                        if (layer.x.isFinite() && layer.baseY > 0 && y != layer.y) updates.add(layer to y)
+                        if (window.callMethod("isVisible") != true || layer.effect.callMethod(IS_VALID) != true) {
+                            layer.motion.finish()
+                            layer.nativeMotion.reset()
+                            layer.nativeApplied = false
+                            layer.nativeScene = -1
+                            layer.nativeSampleDeadlineNs = 0
+                            if (layer.reveal.needsFrame(now)) needsFrame = true
+                            continue
+                        }
+                        if (layer.reveal.startIfArmed(now)) {
+                            glassClient.record("unlock reveal started uptimeMs=$now")
+                        }
+                        if (layer.reveal.needsFrame(now)) needsFrame = true
+                        val y = layer.baseY + motionOffset(layer, now) +
+                            layer.reveal.risePx(layer.density, now)
+                        if (layer.nativeSampleDeadlineNs > System.nanoTime()
+                            || (!layer.nativeApplied && layer.motion.isRunning(now))) needsFrame = true
+                        val scale = layer.reveal.scale(now)
+                        val alpha = layer.reveal.alpha(now)
+                        if (layer.x.isFinite() && layer.baseY > 0 &&
+                            (y != layer.y || scale != layer.revealScale ||
+                                alpha != layer.revealAlpha)) {
+                            frames.add(FrameUpdate(layer, y, scale, alpha))
+                        }
                     }
-                    if (updates.isNotEmpty()) {
+                    if (frames.isNotEmpty()) {
                         val transaction = motionTransaction ?: loadClass(TRANSACTION)
                             .getConstructor().newInstance().also { motionTransaction = it }
-                        for ((layer, y) in updates) transaction.callMethod(SET_POSITION, layer.effect, layer.x, y)
+                        for ((layer, y, scale, alpha) in frames) {
+                            // Scale and alpha are written only when they change, so the reveal can
+                            // share one transaction with the real-time follow. The position always
+                            // carries the pivot compensation, which is zero once scale reaches 1.
+                            if (scale != layer.revealScale) applyRevealScale(transaction, layer, scale)
+                            if (alpha != layer.revealAlpha) transaction.callMethod("setAlpha", layer.effect, alpha)
+                            val shift = pivotOffset(scale)
+                            transaction.callMethod(SET_POSITION, layer.effect,
+                                layer.x + layer.width * shift, y + layer.height * shift)
+                            // TODO(twitch-diag): trace frame-loop writes right after an unlock.
+                            if (revealDebugActive() && (alpha != layer.revealAlpha ||
+                                SystemClock.uptimeMillis() - lastFrameDbgUptime > 40L)) {
+                                lastFrameDbgUptime = SystemClock.uptimeMillis()
+                                glassClient.record("reveal dbg frame yOff=${y - layer.baseY} " +
+                                    "alpha=$alpha nativeApplied=${layer.nativeApplied}")
+                            }
+                        }
                         transaction.callMethod("setAnimationTransaction")
-                        transaction.callMethod("setFrameTimelineVsync", animationChoreographer!!.callMethod("getVsyncId") as Long)
+                        transaction.callMethod("setFrameTimelineVsync",
+                            frameClock.choreographer.callMethod("getVsyncId") as Long)
                         transaction.callMethod("apply")
                         // Publish cached positions only after a successful submission.
-                        for ((layer, y) in updates) {
+                        for ((layer, y, scale, alpha) in frames) {
                             layer.y = y
+                            layer.revealScale = scale
+                            layer.revealAlpha = alpha
                             recordMotion(layer, y, layer.motionTime, true, "vsync")
                         }
                     }
+                    directRecoveryDelay = 100L
                     if (needsFrame) scheduleAnimationFrame()
                 }
             }
         }.onFailure {
-            // Optional direct scheduling must not disable the background or touch host surfaces.
+            // Wallpaper/display replacement and suspend can invalidate a cached frame clock or
+            // transaction temporarily. Keep the static background, but rebuild the direct path;
+            // permanently disabling it makes all later gestures lose real-time following.
             directMotionAvailable = false
             runCatching { motionTransaction?.callMethod("close") }
             motionTransaction = null
-            glassClient.record("motion direct frame unavailable=${it.javaClass.simpleName}; using traversal fallback")
+            retireFrameClock(frameClock)
+            glassClient.record("motion direct frame unavailable=${it.javaClass.simpleName}; rebuilding frame channel")
             requestTraversal()
+            scheduleDirectMotionRecovery()
         }
     }
 
-    private fun bindNativeMotion(layer: Layer) {
+    private fun bindNativeMotion(window: Any, layer: Layer) {
         // Bind the Binder identity eagerly so early samples are never lost.
         // The native transport starts sending as soon as hooks are installed,
         // which may precede the first prepareSurfaces where the window is visible.
-        val session = layer.motionSession
-        if (session != null) runCatching {
+        // Re-read the window's Session on every update: HYOS builds a fresh Session for
+        // each launcher process, and a cached one would pin this layer to a dead uid/pid,
+        // so every sample is authenticated away until the desktop is restarted.
+        val current = runCatching { window.getObjectFieldAs<Any>("mSession") }.getOrNull()
+        if (current != null && current !== layer.motionSession) {
+            layer.motionSession = current
+            layer.resetNativeMotion()
+        }
+        val session = layer.motionSession ?: return
+        runCatching {
             val uid = session.getObjectFieldAs<Int>("mUid")
             val pid = session.getObjectFieldAs<Int>("mPid")
-            if (uid >= 10000 && pid > 0 && (uid != layer.nativeUid || pid != layer.nativePid)) {
+            if (uid < 10000 || pid <= 0) return@runCatching
+            if (uid != layer.nativeUid || pid != layer.nativePid) {
+                layer.nativeMotion.reset()
+                layer.nativeApplied = false
+                layer.nativeScene = -1
+                layer.nativeSampleDeadlineNs = 0
                 layer.nativeUid = uid
                 layer.nativePid = pid
-                nativeMotionEndpoint.bindIdentity(uid, pid)
                 glassClient.record("native motion Binder identity uid=$uid pid=$pid")
             }
+            // Re-assert on every traversal, not only when the uid/pid changes. The receiver
+            // retains (and refuses to apply) every sample until this exact identity is bound,
+            // and a module hot reload installs a fresh receiver whose identity store starts
+            // empty. A layer that already holds the right uid/pid would then never bind it, so
+            // real-time following looks dead until the window is recreated - leave and re-enter
+            // the launcher - even though the native side keeps publishing samples.
+            // bindIdentity also promotes an already-retained sample, so a frame that arrived
+            // during the race is recovered in this same traversal instead of being dropped.
+            nativeMotionEndpoint.bindIdentity(uid, pid)
         }.onFailure {
             if (observed.add("native-motion-identity")) {
                 glassClient.record("native motion identity unavailable=${it.javaClass.simpleName}")
@@ -623,19 +1143,75 @@ class HomeDockWindow : BaseHook() {
         }
     }
 
+    /**
+     * Safety net for the receiver identity.
+     *
+     * [bindNativeMotion] re-asserts the exact uid/pid on every launcher traversal, but a
+     * traversal is not guaranteed after the process is replaced: WMS can place the surface
+     * once and then leave the window alone while the device idles. Because the receiver
+     * retains - and refuses to apply - every sample until that identity is bound, a stale
+     * identity would silently kill real-time following until the window happened to be
+     * recreated, which is exactly the "leave and re-enter the launcher fixes it" symptom.
+     * One field read per layer per second is cheap insurance against that.
+     *
+     * The same tick also bounds how stale the dock preferences can be, and applies them directly.
+     * Neither a change callback nor a WMS traversal is guaranteed: the framework can drop the
+     * remote update push, and WMS has no reason to traverse an idle launcher window at all. Since
+     * the loop already exists and only runs while a dock layer is on screen, re-reading here turns
+     * "edited the height, nothing happened until the window was recreated" into at worst one
+     * second of delay.
+     */
+    private fun scheduleNativeBindSweep() {
+        val wm = service ?: return
+        if (stopped || !nativeBindSweepScheduled.compareAndSet(false, true)) return
+        val handler = wm.getObjectFieldAs<Handler>(WM_HANDLER)
+        handler.postDelayed({
+            nativeBindSweepScheduled.set(false)
+            if (stopped) return@postDelayed
+            var keepGoing = false
+            runCatching {
+                val changed = refreshSettings()
+                // Preserve the WM -> layer lock order used by the wallpaper command path.
+                synchronized(wm.getObjectFieldAs<Any>(WM_LOCK)) {
+                    synchronized(layers) {
+                        if (stopped) return@postDelayed
+                        keepGoing = layers.isNotEmpty()
+                        layers.entries.toList().forEach { (window, layer) ->
+                            bindNativeMotion(window, layer)
+                        }
+                        if (changed) {
+                            // Re-apply the geometry ourselves instead of hoping that the traversal
+                            // requested below reaches prepareSurfaces for an idle window. Same
+                            // order the wallpaper command path uses: update, then commit.
+                            layers.keys.toList().forEach { window ->
+                                runCatching { updateLayer(window) }.onFailure {
+                                    glassClient.record("prefs apply failed=${it.javaClass.simpleName}")
+                                }
+                            }
+                        }
+                    }
+                }
+                if (changed) requestTraversal()
+            }.onFailure {
+                if (observed.add("native-bind-sweep")) {
+                    glassClient.record("native motion bind sweep failed=${it.javaClass.simpleName}")
+                }
+            }
+            if (keepGoing) scheduleNativeBindSweep()
+        }, NATIVE_BIND_SWEEP_MS)
+    }
+
     // Called only under the layer lock. The authenticated Binder receiver publishes an
     // immutable latest sample; intermediate queued values never become a second animation.
     private fun motionOffset(layer: Layer, now: Long): Float {
         val sample = nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid)
         if (sample != null) {
-            if (sample.editState() != layer.nativeEditState) {
-                layer.nativeEditState = sample.editState()
-                sample.editHidden()?.let {
-                    setEditMode(layer, it, "native state=${sample.editState()}")
-                }
-            }
             layer.nativeMotion.accept(sample, layer.overview)
             layer.nativeApplied = true
+            layer.nativeSampleDeadlineNs = sample.uptimeNanos() + DockNativeMotion.MAX_AGE_NS
+            if (sample.scene() == 1) {
+                layer.nativeOverviewGeneration = layer.overviewGeneration
+            }
             if (sample.scene() != layer.nativeScene) {
                 layer.nativeScene = sample.scene()
                 layer.motionSamples = 0
@@ -653,6 +1229,7 @@ class HomeDockWindow : BaseHook() {
             layer.nativeApplied = false
             layer.nativeMotion.reset()
             layer.nativeScene = -1
+            layer.nativeSampleDeadlineNs = 0
             layer.motionSamples = 0
             layer.motionEndPending = true
             scheduleAnimationFrame()
@@ -661,37 +1238,164 @@ class HomeDockWindow : BaseHook() {
         return layer.motion.offsetY(layer.density, layer.baseY, now)
     }
 
-    private fun scheduleAnimationFrame() {
-        val wm = service ?: return
-        if (stopped || !frameScheduled.compareAndSet(false, true)) return
-        wm.getObjectFieldAs<Handler>(WM_HANDLER).post {
-            if (stopped) frameScheduled.set(false)
-            else runCatching {
-                val choreographer = animationChoreographer ?: run {
-                    // Match compositor scheduling, instead of adding another app-frame/traversal hop.
-                    runCatching { Choreographer::class.java.getDeclaredMethod("getSfInstance").invoke(null) as Choreographer }
-                        .getOrElse { Choreographer.getInstance() }
-                }.also {
-                    animationChoreographer = it
-                    glassClient.record("motion frame clock ready direct=$directMotionAvailable")
-                }
-                choreographer.postFrameCallback(animationFrame)
-            }.onFailure {
-                // Never let an optional animation callback throw on a system handler thread.
-                animationAvailable = false
-                frameScheduled.set(false)
-                glassClient.record("motion scheduling failed=${it.javaClass.simpleName}: ${it.message?.take(160)}")
-                XposedLog.w(TAG, LOG_TAG, "Dock animation scheduling unavailable; using scene endpoints", it)
-                requestTraversal()
+    private fun createFrameClock(handler: Handler): FrameClock {
+        // OS4 exposes a factory for a non-ThreadLocal Choreographer. Owning the receiver lets us
+        // dispose and truly recreate a channel whose mFrameScheduled stayed latched over suspend;
+        // releasing either system ThreadLocal instance would break unrelated WMS callbacks.
+        val dedicatedAttempt = runCatching {
+            Choreographer::class.java.getDeclaredMethod(
+                "getInstanceForSurfaceControl", Long::class.javaPrimitiveType, Looper::class.java)
+                .apply { isAccessible = true }
+                .invoke(null, 0L, handler.looper) as Choreographer
+        }
+        val dedicated = dedicatedAttempt.getOrNull()
+        dedicatedAttempt.exceptionOrNull()?.let {
+            if (observed.add("native-motion-dedicated-clock")) {
+                glassClient.record("motion dedicated frame clock unavailable=${it.javaClass.simpleName}")
+            }
+        }
+        val clock = if (dedicated != null) {
+            FrameClock(dedicated, true)
+        } else {
+            val shared = runCatching {
+                Choreographer::class.java.getDeclaredMethod("getSfInstance")
+                    .apply { isAccessible = true }
+                    .invoke(null) as Choreographer
+            }.getOrElse { Choreographer.getInstance() }
+            FrameClock(shared, false)
+        }
+        animationFrameClock = clock
+        glassClient.record("motion frame clock ready direct=$directMotionAvailable owned=${clock.owned}")
+        return clock
+    }
+
+    private fun retireFrameClock(expected: FrameClock? = animationFrameClock) {
+        if (expected == null) return
+        if (animationFrameClock === expected) animationFrameClock = null
+        if (expected.owned) runCatching {
+            Choreographer::class.java.getDeclaredMethod("invalidate")
+                .apply { isAccessible = true }
+                .invoke(expected.choreographer)
+        }
+    }
+
+    private fun hasPendingMotionFrame(): Boolean {
+        val now = SystemClock.uptimeMillis()
+        return synchronized(layers) {
+            layers.values.any { layer ->
+                layer.reveal.needsFrame(now)
+                    || nativeMotionEndpoint.latest(layer.nativeUid, layer.nativePid) != null
+                    || (layer.nativeApplied && !layer.overview)
+                    || (!layer.nativeApplied && layer.motion.isRunning(now))
             }
         }
     }
 
-    private fun scheduleNativeExpiryCheck() {
+    private fun scheduleAnimationFrame(urgent: Boolean = false) {
         val wm = service ?: return
-        val delay = DockNativeMotion.MAX_AGE_NS / 1_000_000L + 16L
-        wm.getObjectFieldAs<Handler>(WM_HANDLER).postDelayed({
-            if (!stopped) scheduleAnimationFrame()
+        if (stopped || !directMotionAvailable) return
+        val epoch = frameEpoch.incrementAndGet()
+        val handler = wm.getObjectFieldAs<Handler>(WM_HANDLER)
+        val requestedAt = SystemClock.elapsedRealtimeNanos()
+        if (!scheduledFrameEpoch.compareAndSet(0, epoch)) {
+            val pendingEpoch = scheduledFrameEpoch.get()
+            val pendingSince = scheduledFrameStartedNs.get()
+            if (urgent && pendingEpoch != 0L && pendingSince != 0L
+                && requestedAt - pendingSince >= STALE_FRAME_NS
+                && urgentFrameRecoveryScheduled.compareAndSet(false, true)) {
+                handler.post {
+                    try {
+                        if (scheduledFrameEpoch.get() == pendingEpoch) {
+                            glassClient.record(
+                                "motion progress replaced stale frame epoch=$pendingEpoch")
+                            recoverStalledFrame(pendingEpoch)
+                        }
+                    } finally {
+                        urgentFrameRecoveryScheduled.set(false)
+                    }
+                }
+            }
+            return
+        }
+        scheduledFrameStartedNs.set(requestedAt)
+        handler.post {
+            if (scheduledFrameEpoch.get() != epoch) return@post
+            if (stopped || !directMotionAvailable) clearScheduledFrame(epoch)
+            else runCatching {
+                val clock = animationFrameClock ?: createFrameClock(handler)
+                val callback = Choreographer.FrameCallback { frameTimeNanos ->
+                    if (!clearScheduledFrame(epoch)) return@FrameCallback
+                    if (!stopped) {
+                        if (directMotionAvailable) updateMotionFrame(frameTimeNanos, clock)
+                        else requestTraversal()
+                    }
+                }
+                scheduledFrame = ScheduledFrame(epoch, clock, callback)
+                clock.choreographer.postFrameCallback(callback)
+                // Handler time stops in deep sleep, so this runs shortly after resume even when
+                // the pre-suspend Choreographer callback was silently discarded. The epoch makes
+                // a late old callback harmless after a replacement frame has been posted.
+                handler.postDelayed({ recoverStalledFrame(epoch) }, 100)
+            }.onFailure {
+                // Never let an optional animation callback throw on a system handler thread.
+                animationAvailable = false
+                clearScheduledFrame(epoch)
+                glassClient.record("motion scheduling failed=${it.javaClass.simpleName}: ${it.message?.take(160)}")
+                XposedLog.w(TAG, LOG_TAG, "Dock animation scheduling unavailable; rebuilding frame channel", it)
+                requestTraversal()
+                directMotionAvailable = false
+                retireFrameClock()
+                scheduleDirectMotionRecovery()
+            }
+        }
+    }
+
+    private fun clearScheduledFrame(epoch: Long): Boolean {
+        if (!scheduledFrameEpoch.compareAndSet(epoch, 0)) return false
+        scheduledFrameStartedNs.set(0)
+        if (scheduledFrame?.epoch == epoch) scheduledFrame = null
+        return true
+    }
+
+    private fun cancelScheduledFrame() {
+        val scheduled = scheduledFrame
+        if (scheduled != null) {
+            runCatching { scheduled.clock.choreographer.removeFrameCallback(scheduled.callback) }
+            scheduledFrame = null
+        }
+        scheduledFrameEpoch.set(0)
+        scheduledFrameStartedNs.set(0)
+    }
+
+    private fun recoverStalledFrame(epoch: Long) {
+        if (scheduledFrameEpoch.get() != epoch) return
+        val scheduled = scheduledFrame
+        if (scheduled?.epoch == epoch) {
+            runCatching { scheduled.clock.choreographer.removeFrameCallback(scheduled.callback) }
+        }
+        if (!clearScheduledFrame(epoch)) return
+        retireFrameClock(scheduled?.clock ?: animationFrameClock)
+        glassClient.record("motion frame callback stalled; rebuilding frame clock epoch=$epoch")
+        // Screen-off legitimately has no vsync. Retry immediately only while a real motion
+        // sample/local curve is live; an idle keepalive must not start a 10 Hz recovery loop.
+        if (hasPendingMotionFrame()) scheduleAnimationFrame()
+    }
+
+    private fun scheduleDirectMotionRecovery() {
+        val wm = service ?: return
+        if (stopped || !directRecoveryScheduled.compareAndSet(false, true)) return
+        val handler = wm.getObjectFieldAs<Handler>(WM_HANDLER)
+        val delay = directRecoveryDelay
+        directRecoveryDelay = (directRecoveryDelay * 2).coerceAtMost(5_000L)
+        handler.postDelayed({
+            directRecoveryScheduled.set(false)
+            if (stopped) return@postDelayed
+            cancelScheduledFrame()
+            retireFrameClock()
+            animationAvailable = true
+            directMotionAvailable = true
+            glassClient.record("motion direct frame retry after lifecycle interruption delayMs=$delay")
+            scheduleAnimationFrame()
         }, delay)
     }
 

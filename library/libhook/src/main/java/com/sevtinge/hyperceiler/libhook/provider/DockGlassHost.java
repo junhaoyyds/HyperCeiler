@@ -1,6 +1,25 @@
-/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/*
+ * This file is part of HyperCeiler.
+
+ * HyperCeiler is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License.
+
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+
+ * You should have received a copy of the GNU Affero General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+ * Copyright (C) 2023-2026 HyperCeiler Contributions
+ */
 package com.sevtinge.hyperceiler.libhook.provider;
 
+import android.app.WallpaperColors;
+import android.app.WallpaperManager;
 import android.content.Context;
 import android.graphics.Color;
 import android.graphics.Outline;
@@ -41,6 +60,10 @@ final class DockGlassHost {
     private final HashMap<String, Entry> entries = new HashMap<>();
     private final IBinder lifetime = new Binder();
     private int dockCreates;
+    // Brightness bit the live material was built from (1 = light wallpaper, 0 = dark, -1 = none).
+    // Process-wide because the applied wallpaper is; see probe(). Main-thread writes, volatile for
+    // the readiness call that may read it from the provider dispatch thread.
+    private volatile int appliedBrightnessBit = -1;
     private String lastDockStatus = "no Dock request in this app process";
     private String lastDockRelease = "none";
 
@@ -50,6 +73,8 @@ final class DockGlassHost {
         final View backdrop;
         final IBinder owner;
         final IBinder.DeathRecipient death;
+        // UI night mode from the launcher. It no longer selects the glass token (that follows
+        // the wallpaper brightness now); it is kept for diagnostics and the fallback tint.
         final boolean dark;
         final int radiusPx;
         SurfaceControlViewHost.SurfacePackage parcel;
@@ -62,6 +87,10 @@ final class DockGlassHost {
     }
 
     Bundle call(Context context, String method, String id, Bundle args) {
+        if ("dock_glass_native_record".equals(method)) {
+            checkLauncherRecorder(context);
+            return DockDiagnosticJournal.access(context, args);
+        }
         checkCaller(method);
         return switch (method) {
             case "dock_glass_history" -> DockDiagnosticJournal.access(context, null);
@@ -69,6 +98,17 @@ final class DockGlassHost {
             case "dock_glass_self_test" -> selfTest(context);
             default -> callHost(context, method, id, args);
         };
+    }
+
+    private static void checkLauncherRecorder(Context context) {
+        int uid = Binder.getCallingUid();
+        try {
+            if (uid != context.getPackageManager().getPackageUid("com.miui.home", 0)) {
+                throw new SecurityException("Only the system launcher may record native status");
+            }
+        } catch (android.content.pm.PackageManager.NameNotFoundException error) {
+            throw new SecurityException("System launcher identity is unavailable", error);
+        }
     }
 
     private static void checkCaller(String method) {
@@ -263,8 +303,13 @@ final class DockGlassHost {
         // Inspect the vendor producer state instead of requiring a new frame.
         long timestamp = backgroundTimestamp(entry);
         boolean active = producerActive(entry);
+        // The folder token follows the wallpaper brightness, and a wallpaper change leaves the
+        // producer perfectly healthy. Report "not ready" once so the launcher routes us through
+        // refresh(), which re-resolves the material; otherwise the Dock keeps the old glass.
+        boolean brightnessChanged =
+                (lightWallpaper(entry.view.getContext()) ? 1 : 0) != appliedBrightnessBit;
         Bundle result = new Bundle();
-        result.putBoolean("backgroundReady", active && timestamp > 0);
+        result.putBoolean("backgroundReady", active && timestamp > 0 && !brightnessChanged);
         result.putBoolean("producerActive", active);
         result.putLong("textureTimestamp", timestamp);
         return result;
@@ -335,7 +380,34 @@ final class DockGlassHost {
             Log.i(TAG, "Glass clip enhancement unavailable; rounded outline retained");
         }
         invoke(view, "setMiViewMaterialType", DockGlassPreset.MATERIAL_TYPE);
-        invoke(view, "setMiGlass", (Object) DockGlassPreset.parameters(entry.dark));
+        // The launcher keys its folder-glass token off the wallpaper, not off the UI night
+        // mode, so the material is resolved here on every (re)apply instead of being frozen
+        // into the Entry at creation time. `entry.dark` still drives the compositor fallback.
+        boolean light = lightWallpaper(view.getContext());
+        appliedBrightnessBit = light ? 1 : 0;
+        invoke(view, "setMiGlass", (Object) DockGlassPreset.parameters(light));
+    }
+
+    /**
+     * FolderBlurUtils.buildFolderGlass picks Medium_Thin_High when the applied wallpaper
+     * supports dark text and Medium_Thin_Low otherwise. Mirror that exact rule so the Dock
+     * keeps the native folder icon's glass instead of the control-center card token.
+     *
+     * The hint is read from the system wallpaper on the host's own main thread; it is never
+     * cached, so a later refresh() (fired by the launcher's wallpaper command) re-resolves it.
+     */
+    private static boolean lightWallpaper(Context context) {
+        try {
+            WallpaperManager manager = context.getSystemService(WallpaperManager.class);
+            if (manager == null) return false;
+            WallpaperColors colors = manager.getWallpaperColors(WallpaperManager.FLAG_SYSTEM);
+            // Low bit of the colour hints == HINT_SUPPORTS_DARK_TEXT, the launcher's own test.
+            return colors != null && (colors.getColorHints() & 1) != 0;
+        } catch (Throwable error) {
+            // No colour hints (or no permission): fall back to the low-light folder glass.
+            Log.i(TAG, "Wallpaper colour hints unavailable; keeping the low-light folder glass");
+            return false;
+        }
     }
 
     private static void invalidateMaterial(Entry entry) {

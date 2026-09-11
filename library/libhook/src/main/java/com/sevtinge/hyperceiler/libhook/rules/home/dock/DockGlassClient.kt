@@ -1,4 +1,21 @@
-/* SPDX-License-Identifier: AGPL-3.0-or-later */
+/*
+  * This file is part of HyperCeiler.
+
+  * HyperCeiler is free software: you can redistribute it and/or modify
+  * it under the terms of the GNU Affero General Public License as
+  * published by the Free Software Foundation, either version 3 of the
+  * License.
+
+  * This program is distributed in the hope that it will be useful,
+  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+  * GNU Affero General Public License for more details.
+
+  * You should have received a copy of the GNU Affero General Public License
+  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+  * Copyright (C) 2023-2026 HyperCeiler Contributions
+*/
 package com.sevtinge.hyperceiler.libhook.rules.home.dock
 
 import android.content.Context
@@ -233,7 +250,7 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
     }
 
     /** Verify HyperCeiler's own texture after its parent becomes visible again. */
-    fun resume(ticket: Ticket) {
+    fun resume(ticket: Ticket, allowFallback: Boolean = true) {
         val requestedAt = SystemClock.uptimeMillis()
         val requestEpoch: Int
         synchronized(ticket) {
@@ -262,6 +279,12 @@ internal class DockGlassClient(private val processGuard: DockGlassProcessGuard, 
                     ticket.previouslyReady = true
                     ticket.consecutiveFailures = 0
                     if (!wasReady) changed()
+                } else if (!allowFallback) {
+                    // Settle window: the wallpaper swap keeps the producer busy, so an unhealthy
+                    // probe here is expected and transient. Keep the current material on screen
+                    // instead of flashing the compositor fallback and restarting the producer;
+                    // the caller re-probes once the window closes.
+                    record("glass probe unhealthy during settle; keeping current material")
                 } else {
                     // Put compositor fallback behind the Dock before restarting the
                     // private producer. This prevents a transparent/white flash.
