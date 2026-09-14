@@ -27,6 +27,7 @@
 | 2026-09-14 | r4742 / `3a5b7c4d` | 合并 | 上游 open PR 第一批（修复类）：<br>• #1700 修复状态栏温度/电源功率指示器显示模糊<br>• #1622 DeviceHelper 补回 HyperOS 2 版本信息<br>• #1670 修复「允许冻结受保护的应用」无法冻结应用商店<br>• #1690 修复双排信号图标（全局版 HyperOS）<br>• #1629 修复 Pad 引导式访问无法阻止推出手势<br>• #1646 修复解除小部件大小限制在 HyperOS 3 不可用（**部分合并**，见下） |
 | 2026-09-14 | r4745 / `0d5c6ee0` | 合并 | #1657 引导式访问增强屏蔽增加「移除快捷窗口按钮」。与已合的 #1629 同改 `UiLockApp.java`，用 `git merge-file` 三方合并后人工裁决 2 处冲突：<br>① `SystemUIApplication.onCreate` 拦截器内**两者并列保留** —— 对方的 `installSystemUiHooks()`（把 SystemUI/WMShell 类加载推迟到 onCreate 前）+ 我们 #1629 的 `reconcileStaleLockState()`；<br>② `stopScreenPinning` 的 hook 辅助方法**保留我方版本**（同时覆盖 `OverviewProxyService$1` 与 `LauncherProxyService$1`，比对方只认后者更健壮）。`BaseHook.java` 采用对方版本（跳过抽象方法，避免 libxposed 102 抛 `IllegalArgumentException`） |
 | 2026-09-14 | `fb904dff0` | 合并 | **B/C 档合并（本轮）**：<br>• dock 线：PR #1686 的 4 个新提交（解锁投影 hook、fly-in 样式改名、native 健康检查 worker 修复）<br>• #1667 云服务：国际版 ROM 下为中国区账号解除相册云同步封锁<br>• #1471 桌面布局上限提至 10×20<br>• #1692 powerkeeper：锁定温度最大 fps<br>• #1691 安全服务：背屏支付宝快捷手势<br>• #1698 省电模式允许开启<br>• #1651 OOBE 引导过渡稳定性<br>• #1694 应用详情/桌面卸载时调用第三方包管理器<br>• #1695 Android 17 hooks 适配 + 系统广告/遥测开关（新增 8 个类：`GlobalFileExplorer` / `DisableSecurityAds` / `DisableSecurityTelemetry` / `SkipHomeScan` / `HideHomeEntries` / `HidePersistentNotificationIcons` / `DisableSystemAds` / `DisableSystemTelemetry`）<br>**过程事故**：上一版手工 `base_tree=对方tree` 把 fork 专属文件整片覆盖，已回滚到 `7f7b00b2f` 并用安全合并法重做（详见「事故与教训」） |
+| 2026-09-15 | `49df58ef6` | 修复 | **修复 #1690 引入的双排信号图标取色退化**（用户实测：图标颜色不随背景深浅变化，有时恒白、有时恒黑）。<br>**原因**：A 档合入的 #1690 把 `MobileSignalHook.hookDarkMode()` 里的 `MobileViewHelper.collectFlow(...)` **响应式订阅**换成一次性 `tintFlow.getValue()`，并且只在**直接父类**中按 **`parameterCount == 6`** 找 `onDarkChanged` 作兜底 → 取色锁死在 `bind()` 那一刻的瞬时值；hook 挂不上时只打一行 warning、没有任何补救。<br>**修法**：① 恢复 `collectFlow` 订阅（背景/主题变化持续更新）；② 保留一次性 `readDarkInfo()` 兜底（订阅不可用时仍有值，兼顾 #1690 想修的全局版 HyperOS）；③ `onDarkChanged` 改为**沿继承链向上查找且不限定参数个数**。<br>产物 r4784（`HyperCeiler-2.10.166-49df58ef6-r4784-canary.apk`），run `34880244704` success，全项校验 PASS；同步删除受影响的历史版本 r4742 / r4745 / r4782 |
 
 ## 事故与教训（2026-09-14）
 
@@ -57,6 +58,29 @@
 | `…hookapi.tool.callMethod` / `callMethodAs` | `io.github.lingqiqi5211.ezhooktool.core.callMethod` / `callMethodAs` |
 | `…hookapi.tool.setIntField` / `getAdditionalInstanceField` / `setAdditionalInstanceField` | `…libhook.base.BaseHook` 的**静态方法**（同名） |
 | `…hookapi.tool.EzxHelpUtils` | 已删除，用 EzHookTool 的 `xposed.dsl.*` / `core.*` |
+
+### 依赖坐标对照（`gradle/libs.versions.toml`）
+
+| 迁移前（`7266aaa0`） | 迁移后（≈ 2026-07-19 起） |
+|---|---|
+| `io.github.kyuubiran.ezxhelper:core` = 3.1.1-rc1 | **删除** |
+| — | `io.github.lingqiqi5211.ezhooktool:core` = 1.1.3 |
+| — | `io.github.lingqiqi5211.ezhooktool:hook-xposed-102` = 1.1.3 |
+| `io.github.libxposed:api` = 101.0.1 / `:service` = 101.0.0 | `io.github.libxposed:api` = **102.0.0** / `:service` = 102.0.0 |
+
+### 旧的自研工具层是干什么的（`fe998bf97` 已删）
+
+`library/libhook/.../utils/hookapi/tool/EzxHelpUtils.kt`（968 行，工具入口）+ `KtHelpUtils.kt`（Kotlin 扩展）
++ `tool/internal/Ezx{Class,Field,Method,Hook,Application,ModuleHolder}Helper.kt`（内部实现）
++ `callback/IMethodHook.java`、`callback/IReplaceHook.java`（方法 hook 的 before/after 与 replace 回调接口）。
+
+它是**所有**功能 hook 的公共底座，只做四件事：
+1. 反射查找 —— `findClass` / `findClassIfExists` / 找方法、构造器、字段；
+2. 字段与方法操作 —— `get/setIntField`、`callMethod` / `callMethodAs`、`getAdditionalInstanceField`；
+3. 注册 hook —— `hookMethod` / `beforeHookMethod` / `afterHookMethod` / `hookAllMethods`，把 libxposed 的 `Hooker` 包成 `IMethodHook` / `IReplaceHook`；
+4. 模块生命周期 —— 持有 `XposedModule` 实例、Application 创建/attach 回调。
+
+迁移后**保留**的同类工具（与 hook 底座无关）：`AppsTool.java`、`MiuiDialog.java`、`MiuixPreferenceUtils.kt`、`ResourceViewUtils.kt`、`ResourcesTool.java`、`callback/ICrashHandler.kt`。
 
 > 另外注意：「文件按 import 猜路径」的校验会误报。`DataSimFlowProxy`（在 `MobileViewHelper.kt`）、
 > `KotlinJob`（在 `JavaAdapter.kt`）、`findViewByIdName`（在 `ResourceViewUtils.kt`）、`clazzMiuiBuild`（在 `loadClassByLazy.kt`）、
