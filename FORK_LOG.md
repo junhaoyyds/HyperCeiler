@@ -25,13 +25,13 @@
 | 2026-09-14 | r4725 / `8bb544e4` | 合并 | `LDS-XiaoYe:os4-personal` 的 2 个提交：修复玻璃面板整体消失（`setVisible()` 幂等化 + 新增 `DockRotationPolicy` 走 display rotation）与横屏返回竖屏后玻璃颜色错乱（新增 `DockGlassGeometry` 钉住 host 的 `mConfigRot`）。顺带新增 3 个解锁动画样式 |
 | 2026-09-14 | `cbd66808` | CI | `nightly.yml` 的 changelog 增加「本次 fork 侧合并/调整」段落（`git log --merges`，原有的 `--no-merges` 会把合并记录全部过滤掉），native 库名改为从 `native_init.list` 动态读取（原硬编码旧库名） |
 | 2026-09-14 | r4742 / `3a5b7c4d` | 合并 | 上游 open PR 第一批（修复类）：<br>• #1700 修复状态栏温度/电源功率指示器显示模糊<br>• #1622 DeviceHelper 补回 HyperOS 2 版本信息<br>• #1670 修复「允许冻结受保护的应用」无法冻结应用商店<br>• #1690 修复双排信号图标（全局版 HyperOS）<br>• #1629 修复 Pad 引导式访问无法阻止推出手势<br>• #1646 修复解除小部件大小限制在 HyperOS 3 不可用（**部分合并**，见下） |
+| 2026-09-14 | r4745 / `0d5c6ee0` | 合并 | #1657 引导式访问增强屏蔽增加「移除快捷窗口按钮」。与已合的 #1629 同改 `UiLockApp.java`，用 `git merge-file` 三方合并后人工裁决 2 处冲突：<br>① `SystemUIApplication.onCreate` 拦截器内**两者并列保留** —— 对方的 `installSystemUiHooks()`（把 SystemUI/WMShell 类加载推迟到 onCreate 前）+ 我们 #1629 的 `reconcileStaleLockState()`；<br>② `stopScreenPinning` 的 hook 辅助方法**保留我方版本**（同时覆盖 `OverviewProxyService$1` 与 `LauncherProxyService$1`，比对方只认后者更健壮）。`BaseHook.java` 采用对方版本（跳过抽象方法，避免 libxposed 102 抛 `IllegalArgumentException`） |
 
 ## 未追 / 待处理
 
 | PR | 原因 | 处理 |
 |---|---|---|
 | #1643 opt: DisableReroute target change | 代码引用 `com.sevtinge.hyperceiler.libhook.callback.IMethodHook` 与 `io.github.kuuubiran.ezxhelper.*`，**本仓库均不存在**（`libhook/callback/` 下只有 `ICrashHandler.kt`）；作者基于旧 API 编写 | 不直接合，需按当前 API 移植 |
-| #1657 fix: 引导式访问增强屏蔽增加移除快捷窗口按钮 | 与已合的 #1629 同改 `UiLockApp.java`，且其分支落后 #1629 三个提交（`diverged`） | 等作者 rebase 或上游合并后再跟 |
 | #1646 的 `ResizableWidgets.kt` | 新代码依赖 `utils.hookapi.tool.hookAllMethods` / `callMethodOrNull`，本仓库无此 API；但其 XML（`home_other_new.xml` 的 SwitchPreference）、3 处文案、`HomePad`/`HomePhone` 的 hook 注册已采用 | 待上游合并后跟 |
 | #1687 / #1688 perf（tryigit） | 两个 PR 内容重复；且都改 `settings.gradle.kts`（本 fork CI 的 `GIT_ACTOR`/`GIT_TOKEN` 逻辑所在） | 二选一，合并后须重跑 CI |
 | #1625 / #1621 dependabot | 改的是本 fork 已删除的 `ci_build.yml` / `release_build.yml` | 忽略 |
