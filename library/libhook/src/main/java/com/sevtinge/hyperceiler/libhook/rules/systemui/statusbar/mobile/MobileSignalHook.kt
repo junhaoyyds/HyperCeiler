@@ -66,11 +66,34 @@ abstract class MobileSignalHook : StatusBarHook() {
             .createAfterHook { param ->
                 val container = param.args[0] as? ViewGroup ?: return@createAfterHook
                 val binding = param.result ?: return@createAfterHook
-                dispatchDarkInfo(container, binding, callback)
+
+                val tintFlow = findTintLightColorFlow(binding)
+                if (tintFlow == null) {
+                    XposedLog.w(TAG, lpparam.packageName, "hookDarkMode: tintLightColorFlow not found")
+                    return@createAfterHook
+                }
+
+                // 兜底：先派发一次当前值，保证订阅不可用时也有值
+                readDarkInfo(tintFlow)?.let { callback(container, it) }
+
+                // 响应式订阅：背景深浅 / 主题变化时持续更新
+                MobileViewHelper.collectFlow(container, tintFlow) { triple ->
+                    try {
+                        callback(container, extractDarkInfo(triple))
+                    } catch (e: Throwable) {
+                        XposedLog.e(TAG, lpparam.packageName, "hookDarkMode flow error", e)
+                    }
+                }
             }
 
-        val darkChangedMethod = modernStatusBarMobileView.superclass?.declaredMethods
-            ?.firstOrNull { it.name == "onDarkChanged" && it.parameterCount == 6 }
+        // 沿继承链向上查找 onDarkChanged，不限定参数个数
+        var darkChangedMethod: java.lang.reflect.Method? = null
+        var darkChangedOwner: Class<*>? = modernStatusBarMobileView.superclass
+        while (darkChangedOwner != null && darkChangedMethod == null) {
+            darkChangedMethod = darkChangedOwner.declaredMethods
+                .firstOrNull { it.name == "onDarkChanged" }
+            darkChangedOwner = darkChangedOwner.superclass
+        }
         if (darkChangedMethod == null) {
             XposedLog.w(TAG, lpparam.packageName, "hookDarkMode: onDarkChanged not found")
         } else {
@@ -88,16 +111,21 @@ abstract class MobileSignalHook : StatusBarHook() {
         binding: Any,
         callback: (ViewGroup, DarkInfo) -> Unit
     ) {
-        try {
-            val tintFlow = findTintLightColorFlow(binding)
-            if (tintFlow == null) {
-                XposedLog.w(TAG, lpparam.packageName, "hookDarkMode: tintLightColorFlow not found")
-                return
-            }
-            val triple = tintFlow.callMethodAs<Any>("getValue")
-            callback(container, extractDarkInfo(triple))
+        val tintFlow = findTintLightColorFlow(binding)
+        if (tintFlow == null) {
+            XposedLog.w(TAG, lpparam.packageName, "hookDarkMode: tintLightColorFlow not found")
+            return
+        }
+        readDarkInfo(tintFlow)?.let { callback(container, it) }
+    }
+
+    /** 读取 tintFlow 的当前值并转换为 DarkInfo（一次性） */
+    private fun readDarkInfo(tintFlow: Any): DarkInfo? {
+        return try {
+            extractDarkInfo(tintFlow.callMethodAs<Any>("getValue"))
         } catch (e: Throwable) {
             XposedLog.e(TAG, lpparam.packageName, "hookDarkMode callback error", e)
+            null
         }
     }
 
