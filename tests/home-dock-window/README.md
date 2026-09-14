@@ -59,30 +59,72 @@ javac -d "$dock_test_dir" \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWindowPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassPreset.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockRecentsMotion.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockUnlockReveal.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRetryPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassSurfaceLease.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassProcessPolicy.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockWallpaperEndpoint.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotion.java \
   library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockNativeMotionEndpoint.java \
+  library/libhook/src/main/java/com/sevtinge/hyperceiler/libhook/rules/home/dock/DockGlassRecoveryGate.java \
   tests/home-dock-window/stubs/android/os/IBinder.java \
   tests/home-dock-window/stubs/android/os/Binder.java \
   tests/home-dock-window/stubs/android/os/Parcel.java \
   tests/home-dock-window/DockWindowPolicyTest.java \
   tests/home-dock-window/DockGlassPresetTest.java \
   tests/home-dock-window/DockRecentsMotionTest.java \
+  tests/home-dock-window/DockUnlockRevealTest.java \
   tests/home-dock-window/DockGlassRetryPolicyTest.java \
   tests/home-dock-window/DockGlassSurfaceLeaseTest.java \
   tests/home-dock-window/DockGlassProcessPolicyTest.java \
   tests/home-dock-window/DockWallpaperEndpointTest.java \
   tests/home-dock-window/DockNativeMotionTest.java \
-  tests/home-dock-window/DockNativeMotionEndpointTest.java
-for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion DockNativeMotionEndpoint; do
+  tests/home-dock-window/DockNativeMotionEndpointTest.java \
+  tests/home-dock-window/DockGlassRecoveryGateTest.java
+for test in DockWindowPolicy DockGlassPreset DockRecentsMotion DockUnlockReveal DockGlassRetryPolicy DockGlassSurfaceLease DockGlassProcessPolicy DockWallpaperEndpoint DockNativeMotion DockNativeMotionEndpoint DockGlassRecoveryGate; do
   java -cp "$dock_test_dir" "com.sevtinge.hyperceiler.tests.dock.${test}Test"
 done
 ```
 
 ## Required device verification (not covered by host tests)
+
+Unlock reveal uses the early `keyguardGoingAway(int)` epoch. A late-created/visible
+layer joins that epoch instead of replaying from zero. Repeated transition callbacks
+use the same 1221ms restart guard for both existing layers and the pending epoch.
+In direct mode, already-visible layers keep animation position/alpha/matrix writes
+on the frame clock; ordinary WMS material traversals must not queue an older pose.
+First-show and actual geometry changes still carry their pose in WMS's transaction.
+`DockUnlockRevealTest` checks epoch alignment, duplicate events, expiry while hidden,
+rapid successive unlocks, and uptime-zero boundaries. It does not validate SurfaceFlinger
+transaction order or the actual Flutter icon trajectory.
+Clock expiry is separate from final-pose submission: a persistent pending-pose flag
+survives repeated lost callbacks and is cleared only after submitting the resting pose.
+The tests also cover rise-only residue after opacity reaches one, cancelled reveals,
+and retrying the terminal frame without falsely acknowledging an unsubmitted pose.
+
+The `lift-settle-v3` reveal rises from 96dp below the Dock, overshoots by about
+5.5dp once, and lands with zero velocity within the same 821ms window. It holds
+the start pose for a measured 10ms icon lead, because the launcher's own
+`_showPresent` follows the keyguard epoch by 9-10ms, so the background starts on
+the same phase as the dock icons. Opacity uses an independent 180ms smoothstep
+fade so the return cannot pulse the glass.
+The parent stays at scale 1; material presets and render surfaces are unchanged.
+Tests bound the full trajectory, opacity, number of reversals, exact resting
+endpoint, and a late-created surface joining the landing after skipped frames.
+
+After loading the new system hook, verify
+`phase=going-away pose=single-clock-v2 style=lift-settle-v3`.
+Each transition-start also records `riseDp=96.0 style=lift-settle-v3`, so a
+missed initialization log does not hide which curve is running. On the September 12
+trace, native icon starts followed the keyguard epoch by 9–10ms and lasted about
+0.8s. Verify the launcher's `_showPresent` actually occurs: a stuck
+`isWorkspaceLoading=true` state can suppress icon fly-in while the background's
+keyguard-triggered animation still runs.
+Test fingerprint unlock from doze and unlock from the lit lock screen, including
+repeated unlocks and a launcher-surface recreation. Record whether the Dock flashes at
+rest before moving or abruptly jumps during the intended gentle landing. Host tests and an APK install alone
+do not prove these visual results. The 821ms rise/fade remains a local approximation,
+not per-frame sampling of Flutter's staggered 3D unlock animation.
 
 1. Install the APK, enable the System Framework scope, and reboot the device.
 2. Enable Dock background; select system material. Confirm `HomeDockWindow` logs contain
@@ -125,6 +167,24 @@ and rechecks readiness; the native layer is not exposed while that restart draws
 
 `DockGlassRetryPolicyTest` verifies the backoff/readiness limits on the host JDK.
 Actual boot-time recovery and cancellation still require device verification.
+
+Every asynchronous glass entry point runs behind one boundary that catches
+`Exception` only; `Error` and other VM-fatal throwables are never swallowed, so
+the renderer path can no longer escape into the system-server uncaught handler.
+The same restriction applies to the recoverable-failure helper used for
+attachment, probe, refresh and cleanup: Kotlin's `runCatching` catches
+`Throwable`, so it is deliberately not used here.
+A temporarily unavailable renderer package is treated as a retryable dependency
+outage rather than a hard failure: `PackageManager.NameNotFoundException` fails
+the attempt safely and schedules a bounded 1/2/4/8/16/30s retry that never
+exhausts and does not consume the compatibility budget. The resolved renderer UID
+is cached and reused only while `getPackagesForUid` still attributes it to the
+package; no `Context`, `ClassLoader` or file reference is cached across upgrades.
+Recovery is single-flight: a duplicate request while one is pending is ignored and
+counted, retired tickets reject stale generation/readiness/refresh callbacks, and
+`release` is idempotent. `DockGlassRecoveryGateTest` covers the outage, the
+single-flight latch, the exhausted budget, stale generations, idempotent
+retirement, refresh deduplication and closed-client admission.
 
 The diagnostic build records a bounded history (96 metadata events) in
 HyperCeiler's private device-protected storage, independently of release logging

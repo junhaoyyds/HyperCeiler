@@ -1,13 +1,35 @@
 /* SPDX-License-Identifier: AGPL-3.0-or-later */
+/*
+ * NativeHookRuntime image layer: runtime mapping inventory, container
+ * attribution and mapping generations.
+ *
+ * Abstracted from the desktop Dart hook's dock_native_runtime.h (this
+ * project's own mature implementation). The desktop-specific naming
+ * (`libapp.so`, "AOT image") moved out; everything here speaks of images and
+ * containers so any native library - a plain system `.so`, an
+ * application-installed `.so`, or a library mapped straight out of an APK
+ * ZIP - is described by the same vocabulary.
+ *
+ * Design invariants carried over unchanged:
+ *  - A whole-file inventory is kept, never a name-filtered one: Android maps
+ *    libraries straight out of APKs (extractNativeLibs=false), the kernel
+ *    reports the container path, and sibling libraries share it. Ownership is
+ *    decided by the image's own program headers, never by a name.
+ *  - Two candidate images claiming one mapping range is ambiguous: fail closed.
+ *  - Writable executable mappings never contribute hook targets.
+ *  - Bounded budgets everywhere: a pathological inventory must not be able to
+ *    grow memory or runtime without bound.
+ */
 #pragma once
 
-#include <array>
+#include "elf_image.h"
+#include "nhk_base.h"
+
 #include <algorithm>
-#include <cstddef>
+#include <array>
+#include <concepts>
 #include <cstdint>
-#include <cstdio>
 #include <fstream>
-#include <istream>
 #include <optional>
 #include <span>
 #include <string>
@@ -15,7 +37,7 @@
 #include <utility>
 #include <vector>
 
-namespace dock_motion {
+namespace nhk {
 
 inline constexpr size_t kMaxExecutableMappings = 64;
 inline constexpr size_t kMaxExecutableCodeBytes = 256U * 1024U * 1024U;
@@ -41,7 +63,7 @@ struct ExecutableMapping {
     std::optional<CodeSource> source_at(uintptr_t address, size_t bytes) const {
         if (bytes == 0 || address < begin || address >= end || bytes > end - address) return {};
         const uint64_t displacement = address - begin;
-        if (displacement > UINT64_MAX - file_offset) return {};
+        if (add_overflows(file_offset, displacement)) return {};
         return CodeSource{device_major, device_minor, inode, file_offset + displacement};
     }
 
@@ -90,19 +112,12 @@ inline std::string_view strip_deleted(std::string_view path) {
     return path;
 }
 
-/** A file that is itself the AOT image rather than a container holding one. */
-inline bool libapp_path(std::string_view path) {
-    path = strip_deleted(path);
-    return path == "libapp.so" || path.ends_with("/libapp.so");
-}
-
 /**
  * One parsed `/proc/self/maps` line naming a file-backed range.
  *
- * The whole file inventory is kept, not just `.so` names: HYOS maps its AOT image
- * straight out of the application APK, where the kernel reports the APK path and
- * the same file also backs unrelated libraries. Ownership is therefore decided by
- * the embedded ELF's own program headers (see [EmbeddedImage]), never by a name.
+ * The whole file inventory is kept, not just `.so` names: an image may be
+ * mapped straight out of its application container, where the kernel reports
+ * the container path and the same file also backs unrelated libraries.
  */
 struct FileMapping {
     uintptr_t begin;
@@ -150,8 +165,8 @@ inline std::vector<FileMapping> parse_file_mappings(std::istream &maps) {
     return result;
 }
 
-/** A file-backed ELF image: either a bare `.so` or one embedded in a container. */
-struct LibappContainer {
+/** A file-backed ELF image: either a bare library or one embedded in a container. */
+struct ImageContainer {
     std::string path;    // Inventory path with " (deleted)" removed.
     uint64_t view_begin; // Container file offset of the ELF header.
     uint64_t view_end;   // One past the last container offset mapped from that ELF.
@@ -164,36 +179,56 @@ struct EmbeddedImage {
     bool has_executable = false;
 };
 
-inline uint16_t load_le16(const std::byte *bytes) {
-    return static_cast<uint16_t>(std::to_integer<uint16_t>(bytes[0]))
-        | static_cast<uint16_t>(std::to_integer<uint16_t>(bytes[1]) << 8);
-}
+/**
+ * Decode an ELF64 program header table that starts at the ELF header.
+ *
+ * `bytes` must begin at the image's ELF header and be long enough to hold the
+ * header plus its whole program header table; the caller supplies whatever it
+ * could read from the mapped image. Only the loadable segment table is used:
+ * it bounds the container view and reports whether an executable segment
+ * exists. No address, file offset, Build ID or segment count is pinned.
+ */
+inline std::optional<EmbeddedImage> parse_embedded_image(
+    std::span<const std::byte> bytes, uint64_t view_begin) {
+    // The program header table is decoded by the shared decoder (loose mode: a
+    // container probe needs the segment list, not ARM64/ET_DYN semantics), so
+    // there is exactly one place that knows the layout.
+    const auto segments = elf::parse_program_segments(bytes, /*require_arm64_dyn=*/false);
+    if (!segments) return {};
 
-inline uint32_t load_le32(const std::byte *bytes) {
-    return static_cast<uint32_t>(load_le16(bytes))
-        | (static_cast<uint32_t>(load_le16(bytes + 2)) << 16);
-}
-
-inline uint64_t load_le64(const std::byte *bytes) {
-    return static_cast<uint64_t>(load_le32(bytes))
-        | (static_cast<uint64_t>(load_le32(bytes + 4)) << 32);
+    EmbeddedImage image{view_begin, view_begin, false};
+    for (const auto &segment : *segments) {
+        if (segment.type != elf::kProgramTypeLoad || segment.filesz == 0) continue;
+        if (add_overflows(segment.offset, segment.filesz)) return {};
+        const uint64_t relative_end = segment.offset + segment.filesz;
+        if (relative_end > image.view_end - view_begin) {
+            image.view_end = view_begin + relative_end;
+        }
+        if ((segment.flags & elf::kFlagExecute) != 0) image.has_executable = true;
+    }
+    if (!image.has_executable || image.view_end <= image.view_begin) return {};
+    return image;
 }
 
 /**
- * Locate a stored `libapp.so` entry inside a zip container such as an APK.
+ * Locate a stored, uncompressed and page-aligned entry inside a ZIP container
+ * such as an APK.
  *
- * Android keeps the launcher's native libraries uncompressed and page aligned
- * inside its APK, so the extracted file may not exist on disk at all and the
- * kernel reports the APK path for every library it backs. Recovering the entry's
+ * Android keeps native libraries uncompressed and page aligned inside their
+ * APK, so the extracted file may not exist on disk at all and the kernel
+ * reports the APK path for every library it backs. Recovering the entry's
  * data offset is what makes the executable ranges attributable to one image.
+ *
+ * `entry_suffix` matches an entry whose name equals it or ends with "/" + it,
+ * so callers can address `libapp.so` under any `lib/<abi>/` directory.
  *
  * Returns `{data_offset, size}` or nothing. Central directories with more than
  * one candidate, compressed entries, entries using a data descriptor, split
  * archives and ZIP64 are all refused: an ambiguous or unverifiable container
  * must never be guessed at.
  */
-inline std::optional<std::pair<uint64_t, uint64_t>> zip_stored_libapp(
-    const std::string &path) {
+inline std::optional<std::pair<uint64_t, uint64_t>> zip_stored_entry(
+    const std::string &path, std::string_view entry_suffix) {
     constexpr uint32_t kEndOfCentralDirectory = 0x06054b50U;
     constexpr uint32_t kCentralHeader = 0x02014b50U;
     constexpr uint32_t kLocalHeader = 0x04034b50U;
@@ -245,6 +280,11 @@ inline std::optional<std::pair<uint64_t, uint64_t>> zip_stored_libapp(
         static_cast<std::streamsize>(directory.size()));
     if (static_cast<uint64_t>(file.gcount()) != directory_bytes) return {};
 
+    const std::string nested = std::string("/").append(entry_suffix);
+    const auto entry_matches = [&](std::string_view name) {
+        return name == entry_suffix || name.ends_with(nested);
+    };
+
     std::optional<std::pair<uint64_t, uint64_t>> found;
     size_t at = 0;
     for (uint16_t index = 0; index < entries; ++index) {
@@ -264,7 +304,7 @@ inline std::optional<std::pair<uint64_t, uint64_t>> zip_stored_libapp(
             reinterpret_cast<const char *>(directory.data() + at + kCentralHeaderBytes),
             name_bytes);
         at += kCentralHeaderBytes + name_bytes + extra_bytes + comment_bytes;
-        if (name != "libapp.so" && !name.ends_with("/libapp.so")) continue;
+        if (!entry_matches(name)) continue;
         // Only an uncompressed, descriptor-free entry is mapped in place.
         if (method != 0 || (flags & 0x08U) != 0 || compressed != uncompressed
             || compressed == 0 || compressed == kUnknown32
@@ -291,72 +331,22 @@ inline std::optional<std::pair<uint64_t, uint64_t>> zip_stored_libapp(
 }
 
 /**
- * Decode an ELF64 program header table that starts at the ELF header.
- *
- * `bytes` must begin at the image's ELF header and be long enough to hold the
- * header plus its whole program header table; the caller supplies whatever it
- * could read from the mapped image. Only the loadable segment table is used: it
- * bounds the container view and reports whether an executable segment exists.
- * No launcher address, file offset, Build ID or segment count is pinned.
- */
-inline std::optional<EmbeddedImage> parse_embedded_image(
-    std::span<const std::byte> bytes, uint64_t view_begin) {
-    constexpr size_t kHeaderBytes = 64;
-    constexpr size_t kProgramHeaderBytes = 56;
-    constexpr uint32_t kProgramHeaderLoad = 1;
-    constexpr uint32_t kSegmentFlagExecutable = 1;
-    constexpr uint16_t kMaxProgramHeaders = 128;
-    if (bytes.size() < kHeaderBytes) return {};
-    if (bytes[0] != std::byte{0x7f} || bytes[1] != std::byte{'E'}
-        || bytes[2] != std::byte{'L'} || bytes[3] != std::byte{'F'}) return {};
-    // ELF64, little endian, current version. Anything else fails closed.
-    if (bytes[4] != std::byte{2} || bytes[5] != std::byte{1}) return {};
-    const uint64_t program_offset = load_le64(bytes.data() + 32);
-    const uint16_t program_entry_size = load_le16(bytes.data() + 54);
-    const uint16_t program_count = load_le16(bytes.data() + 56);
-    if (program_entry_size != kProgramHeaderBytes || program_count == 0
-        || program_count > kMaxProgramHeaders) return {};
-    if (program_offset > bytes.size()
-        || static_cast<size_t>(program_count) * kProgramHeaderBytes
-            > bytes.size() - program_offset) return {};
-
-    EmbeddedImage image{view_begin, view_begin, false};
-    for (uint16_t index = 0; index < program_count; ++index) {
-        const std::byte *header = bytes.data() + program_offset
-            + static_cast<size_t>(index) * kProgramHeaderBytes;
-        if (load_le32(header) != kProgramHeaderLoad) continue;
-        const uint32_t flags = load_le32(header + 4);
-        const uint64_t offset = load_le64(header + 8);
-        const uint64_t file_size = load_le64(header + 32);
-        if (file_size == 0) continue;
-        if (offset > UINT64_MAX - file_size) return {};
-        const uint64_t relative_end = offset + file_size;
-        if (relative_end > image.view_end - view_begin) {
-            image.view_end = view_begin + relative_end;
-        }
-        if ((flags & kSegmentFlagExecutable) != 0) image.has_executable = true;
-    }
-    if (!image.has_executable || image.view_end <= image.view_begin) return {};
-    return image;
-}
-
-/**
- * Select the executable container ranges owned by one discovered AOT image.
+ * Select the executable container ranges owned by one discovered image.
  *
  * A range is accepted only when its recorded file identity resolves inside the
  * image's own view, so sibling libraries sharing the container file can never
  * contribute code. Offsets are rebased on the view start, keeping
  * [CodeSource::file_offset] stable across reloads of the same image.
  */
-inline std::vector<ExecutableMapping> executable_libapp_mappings(
+inline std::vector<ExecutableMapping> owned_image_mappings(
     const std::vector<FileMapping> &mappings,
-    const std::vector<LibappContainer> &containers) {
+    const std::vector<ImageContainer> &containers) {
     std::vector<ExecutableMapping> result;
     size_t total = 0;
     for (const auto &mapping : mappings) {
         if (!mapping.executable) continue;
         const std::string_view path = strip_deleted(mapping.path);
-        const LibappContainer *owner = nullptr;
+        const ImageContainer *owner = nullptr;
         for (const auto &container : containers) {
             if (container.path != path) continue;
             if (mapping.file_offset < container.view_begin
@@ -389,22 +379,199 @@ inline std::vector<ExecutableMapping> executable_libapp_mappings(
 }
 
 /**
- * Inventory of bare `.so` generations only.
- *
- * Kept for artifact-independent reasoning and host tests; the device path also
- * discovers images embedded in an application container.
+ * Inventory of bare-file image generations only, for a caller-supplied path
+ * predicate. Kept for artifact-independent reasoning and host tests; the
+ * device path also discovers images embedded in an application container.
  */
-inline std::vector<ExecutableMapping> executable_libapp_mappings(std::istream &maps) {
+template<typename PathPredicate>
+requires std::invocable<PathPredicate, std::string_view>
+inline std::vector<ExecutableMapping> bare_image_mappings(
+    std::istream &maps, PathPredicate is_image_path) {
     const auto mappings = parse_file_mappings(maps);
-    std::vector<LibappContainer> containers;
+    std::vector<ImageContainer> containers;
     for (const auto &mapping : mappings) {
         const std::string_view path = strip_deleted(mapping.path);
-        if (!libapp_path(path)) continue;
+        if (!is_image_path(path)) continue;
         const bool known = std::ranges::any_of(containers,
-            [&](const LibappContainer &container) { return container.path == path; });
+            [&](const ImageContainer &container) { return container.path == path; });
         if (!known) containers.push_back({std::string(path), 0, UINT64_MAX});
     }
-    return executable_libapp_mappings(mappings, containers);
+    return owned_image_mappings(mappings, containers);
+}
+
+/**
+ * One mapped range of an image, expressed in the image's virtual address space.
+ */
+struct MappedRange {
+    uint64_t vaddr = 0;   // Virtual address of the first byte of the range.
+    uintptr_t begin = 0;  // Runtime address of that same byte.
+    uint64_t bytes = 0;   // Mapped length.
+};
+
+/**
+ * A whole image as it is mapped, described by virtual address.
+ *
+ * `load_base` is the runtime address of virtual address 0, `needed_vaddr` is
+ * how far a snapshot must reach to cover the image (the highest segment end,
+ * including a dynamic segment that sits far above the first pages), and
+ * `ranges` are the mapped ranges sorted by virtual address.
+ */
+struct ImageView {
+    uint64_t load_base = 0;
+    uint64_t needed_vaddr = 0;
+    std::vector<MappedRange> ranges;
+};
+
+/**
+ * Build an image view from `mappings` and an already-decoded program header
+ * table.
+ *
+ * This is the only correct way to place a runtime mapping in the image's
+ * virtual address space: a load segment's `p_offset` and `p_vaddr` routinely
+ * differ by a segment-specific amount (a system library measured 0x0 / 0x10000
+ * / 0x20000 / 0x30000 across four PT_LOADs), so the file→virtual relation has
+ * to come from the program headers, never from assuming `begin - file_offset`
+ * is constant.
+ *
+ * Ownership is still verified, just correctly: every mapping of `path` must
+ * fall inside some load segment's *file* range, and every mapping must agree on
+ * one load bias (`begin - vaddr`). A mapping that no segment claims, two
+ * segments claiming one offset, disagreeing biases, or overlapping virtual
+ * ranges all fail closed.
+ */
+inline std::optional<ImageView> image_view_from_segments_in_window(
+    const std::vector<FileMapping> &mappings, std::string_view path,
+    std::span<const elf::ProgramSegment> segments, uint64_t view_begin,
+    uint64_t view_end) {
+    ImageView view;
+    uint64_t needed = 0;
+    for (const auto &segment : segments) {
+        if (segment.type != elf::kProgramTypeLoad && segment.type != elf::kProgramTypeDynamic) {
+            continue;
+        }
+        needed = std::max<uint64_t>(needed, segment.vaddr + segment.memsz);
+    }
+    if (needed == 0) return {};
+    view.needed_vaddr = needed;
+
+    const uint64_t page = host_page_size();
+    // The kernel maps a load segment page-aligned on both sides, so a mapping
+    // can be claimed by two segments at once (the last page of one and the
+    // first page of the next often share a file offset). Ownership is therefore
+    // decided by the *load bias* the mapping implies, not by the file offset
+    // alone: every mapping of one image must imply the same bias.
+    struct Candidate {
+        uint64_t vaddr;
+        uint64_t bias;
+        uint64_t bytes;
+        uint64_t file_offset;
+    };
+    std::vector<std::vector<Candidate>> rows;
+    for (const auto &mapping : mappings) {
+        if (strip_deleted(mapping.path) != path) continue;
+        // A container-backed image shares its path with every sibling library
+        // stored in the same APK, so the path alone cannot select its mappings -
+        // the *view window* (the stored entry's page range inside the container)
+        // is what does. A bare file has the trivial window [0, UINT64_MAX) and
+        // its reported offsets already are image offsets, so the two cases agree
+        // once the relative offset is taken first.
+        if (mapping.file_offset < view_begin || mapping.file_offset >= view_end) continue;
+        const uint64_t relative = mapping.file_offset - view_begin;
+        const uint64_t length = mapping.end - mapping.begin;
+        if (length == 0 || length > kMaxExecutableCodeBytes) return {};
+        std::vector<Candidate> row;
+        for (const auto &segment : segments) {
+            if (segment.filesz == 0) continue;
+            const uint64_t segment_page = page_down(segment.offset);
+            const uint64_t segment_page_end = page_up(segment.offset + segment.filesz);
+            if (relative < segment_page || relative >= segment_page_end) {
+                continue;
+            }
+            const uint64_t delta = relative - segment_page;
+            if (delta % page != 0) continue; // A mapping starts on a page boundary.
+            const uint64_t vaddr = page_down(segment.vaddr) + delta;
+            if (add_overflows(vaddr, length) || mapping.begin < vaddr) continue;
+            row.push_back({vaddr, mapping.begin - vaddr, length, relative});
+        }
+        if (row.empty()) return {};
+        rows.push_back(std::move(row));
+    }
+    if (rows.empty()) return {};
+
+    // Exactly one load bias must be consistent across every mapping.
+    std::optional<uint64_t> agreed;
+    for (const auto &candidate : rows.front()) {
+        const uint64_t bias = candidate.bias;
+        bool everywhere = true;
+        for (size_t i = 1; i < rows.size() && everywhere; ++i) {
+            const bool present = std::ranges::any_of(rows[i],
+                [&](const Candidate &other) { return other.bias == bias; });
+            everywhere = present;
+        }
+        if (!everywhere) continue;
+        if (agreed && *agreed != bias) return {};
+        agreed = bias;
+    }
+    if (!agreed) return {};
+    view.load_base = *agreed;
+
+    // Pick the segment each mapping belongs to and merge neighbouring pages:
+    // a segment is reported as a handful of maps, so keeping one range per page
+    // would blow past every range budget for no benefit.
+    //
+    // Once the bias is known, `vaddr = begin - bias` is determined - the
+    // segment only *confirms* the mapping belongs to this image. Two segments
+    // can legitimately confirm the same mapping (page-aligned segment ends
+    // overlap), which is not an ambiguity.
+    std::vector<MappedRange> chosen;
+    for (const auto &row : rows) {
+        // Any candidate carrying the agreed bias yields the same virtual
+        // address (`begin - bias`), so the first match is authoritative.
+        const Candidate *match = nullptr;
+        for (const auto &candidate : row) {
+            if (candidate.bias != view.load_base) continue;
+            match = &candidate;
+            break;
+        }
+        if (match == nullptr) return {};
+        // RELRO re-protection surfaces as a second map of the same address
+        // range; it is the same bytes, so keep the first occurrence.
+        const bool duplicate = std::ranges::any_of(chosen,
+            [&](const MappedRange &range) { return range.vaddr == match->vaddr; });
+        if (duplicate) continue;
+        chosen.push_back({match->vaddr,
+            static_cast<uintptr_t>(view.load_base + match->vaddr), match->bytes});
+    }
+    if (chosen.empty()) return {};
+
+    std::ranges::sort(chosen, {}, &MappedRange::vaddr);
+    for (const auto &range : chosen) {
+        if (!view.ranges.empty()) {
+            auto &previous = view.ranges.back();
+            if (previous.vaddr + previous.bytes == range.vaddr
+                && static_cast<uintptr_t>(previous.begin + previous.bytes) == range.begin) {
+                previous.bytes += range.bytes; // Contiguous: merge into one range.
+                continue;
+            }
+            if (previous.vaddr + previous.bytes > range.vaddr) {
+                return {};
+            }
+        }
+        if (view.ranges.size() >= kMaxExecutableMappings) return {};
+        view.ranges.push_back(range);
+    }
+    return view;
+}
+
+/**
+ * Convenience overload for a bare file image, where every mapping of `path`
+ * belongs to the image and its reported file offsets already are image offsets.
+ */
+inline std::optional<ImageView> image_view_from_segments(
+    const std::vector<FileMapping> &mappings, std::string_view path,
+    std::span<const elf::ProgramSegment> segments) {
+    return image_view_from_segments_in_window(
+        mappings, path, segments, 0, UINT64_MAX);
 }
 
 inline std::optional<CodeSource> source_at(
@@ -452,4 +619,4 @@ inline bool sources_for(const std::vector<ExecutableMapping> &mappings,
     return true;
 }
 
-} // namespace dock_motion
+} // namespace nhk
