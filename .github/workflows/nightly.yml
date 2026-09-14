@@ -125,6 +125,15 @@ jobs:
           else
             COMMITS=$(git log --no-merges --pretty=format:"- %s (%h)" -n 30)
           fi
+          # fork 侧合并的上游内容（merge commit 被 --no-merges 过滤掉，单独列一份）
+          if [ -n "$PREV" ]; then
+            UPSTREAM_MERGES=$(git log --merges --pretty=format:"- %s (%h)" "$RANGE" | grep -E '^- Merge ' || true)
+          else
+            UPSTREAM_MERGES=$(git log --merges --pretty=format:"- %s (%h)" -n 30 | grep -E '^- Merge ' || true)
+          fi
+          # native hook 库名以 native_init.list 为准（历史上改过名，别硬编码）
+          NATIVE_LIB=$(head -n1 library/libhook/src/main/resources/META-INF/xposed/native_init.list 2>/dev/null | tr -d ' \r\n')
+          NATIVE_LIB=${NATIVE_LIB:-unknown}
 
           {
             echo "# 夜版构建日志 / Nightly Build Log"
@@ -136,11 +145,15 @@ jobs:
             echo "- **版本**: \`$VERSION\`"
             echo "- **构建时间**: $BUILDTIME"
             echo "- **产物**: \`$APKNAME\`"
-            echo "- **桌面 hook**: 已内置 \`libhyperceiler_home.so\`（桌面底栏功能，经 \`META-INF/xposed/native_init.list\` 注册）"
+            echo "- **桌面 hook native 库**: \`$NATIVE_LIB\`（经 \`META-INF/xposed/native_init.list\` 注册）"
             echo ""
-            echo "### 相对上次夜版的改动"
+            echo "### 相对上次夜版的改动（上游提交）"
             echo ""
             echo "$COMMITS"
+            echo ""
+            echo "### 本次 fork 侧合并/调整"
+            echo ""
+            if [ -n "$UPSTREAM_MERGES" ]; then echo "$UPSTREAM_MERGES"; else echo "- （无）"; fi
             echo ""
           } > CHANGELOG.md
 
@@ -154,11 +167,15 @@ jobs:
             echo "- **Version**: \`$VERSION\`"
             echo "- **Build time**: $BUILDTIME"
             echo "- **Artifact**: \`$APKNAME\`"
-            echo "- **Desktop dock hook**: \`libhyperceiler_home.so\` bundled (desktop bottom-bar features, registered via \`META-INF/xposed/native_init.list\`)"
+            echo "- **Desktop dock hook native lib**: \`$NATIVE_LIB\` (registered via \`META-INF/xposed/native_init.list\`)"
             echo ""
-            echo "### Changes since last nightly"
+            echo "### Changes since last nightly (upstream commits)"
             echo ""
             echo "$COMMITS"
+            echo ""
+            echo "### Fork-side merges / adjustments in this build"
+            echo ""
+            if [ -n "$UPSTREAM_MERGES" ]; then echo "$UPSTREAM_MERGES"; else echo "- (none)"; fi
             echo ""
           } > CHANGELOG_EN.md
 
