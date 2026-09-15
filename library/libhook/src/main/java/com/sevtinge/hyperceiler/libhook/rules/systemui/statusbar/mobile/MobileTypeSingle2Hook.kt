@@ -94,6 +94,16 @@ object MobileTypeSingle2Hook : BaseHook() {
     private const val LAST_BOUND_VIEW_MODEL_KEY = "mobile_type_single2_last_bound_vm"
     private const val DATA_SIM_CONTEXT_KEY = "MobileTypeSingle2Hook.dataSimContext"
 
+    /**
+     * 每个 VM 复用同一个可见性 flow。
+     *
+     * 视图在 bind 时会订阅 VM 里的 flow 对象，之后模块写的值只有落在**同一个对象**上才会被视图收到。
+     * 旧实现每次绑定都 `newReadonlyStateFlow(...)` 造一个新对象装进字段，老视图订阅的还是旧对象
+     * → 模块的判定永远送不到它，只有重新 bind 过的视图（如下拉通知栏那份）才跟得上。
+     */
+    private const val VISIBILITY_FLOW_KEY = "mobile_type_single2_visibility_flow"
+    private const val DEBUG_LOG = true
+
     private val showNameFlowProxy = DataSimFlowProxy("")
     private val inOutVisibleProxy = DataSimFlowProxy(false)
     private val inOutResIdProxy = DataSimFlowProxy(0)
@@ -125,6 +135,16 @@ object MobileTypeSingle2Hook : BaseHook() {
     private val defaultConnectionsBySubId = ConcurrentHashMap<Int, Any>()
 
     private val boundViews = ConcurrentHashMap<Int, MutableSet<ViewGroup>>()
+
+    /** rootView -> 该视图对应的 cellProvider VM，用于把判定结果回写进它订阅的 flow */
+    private val boundViewModels = ConcurrentHashMap<ViewGroup, Any>()
+
+    /** 只在判定结果变化时打日志，避免刷屏 */
+    private val lastLoggedVisible = ConcurrentHashMap<ViewGroup, Boolean>()
+
+    @Volatile
+    private var unresolvedViewModelLogCount = 0
+
     private val renderStateStore = MobileTypeRenderStateStore()
     private val visibilityResolver = MobileTypeVisibilityResolver(
         showMobileType = showMobileType,
@@ -164,6 +184,11 @@ object MobileTypeSingle2Hook : BaseHook() {
 
     override fun init() {
         BaseHook.registerHandlerHotReloadCleanup(mainHandler)
+        logVisibility(
+            "init",
+            "showMobileType=$showMobileType mobileNetworkType=$mobileNetworkType dual=$isEnableDouble " +
+                "sdk=${android.os.Build.VERSION.SDK_INT} driveLarge=${shouldDriveLargeVisibility()}"
+        )
         if (isEnableDouble) {
             getHotReloadRuntimeState(DATA_SIM_CONTEXT_KEY, Context::class.java)
                 ?.let(::registerDataSimBroadcast)
@@ -172,6 +197,55 @@ object MobileTypeSingle2Hook : BaseHook() {
             registerConnectivityWatcher()
         }
         hookMobileViewAndVM()
+    }
+
+    private fun logVisibility(stage: String, message: String) {
+        if (!DEBUG_LOG) return
+        XposedLog.i(TAG, lpparam.packageName, "[$stage] $message")
+    }
+
+    /** 只有「大 5G 图标由模块判定显隐」时才接管可见性 flow，其余显示逻辑一律不碰 */
+    private fun shouldDriveLargeVisibility(): Boolean {
+        return showMobileType && (mobileNetworkType == 0 || mobileNetworkType == 2)
+    }
+
+    /** 取（或首次创建）该 VM 专用的稳定可见性 flow */
+    private fun visibilityFlowOf(viewModel: Any): Any {
+        runCatching { viewModel.getAdditionalInstanceFieldAs<Any?>(VISIBILITY_FLOW_KEY) }
+            .getOrNull()
+            ?.let { return it }
+        val flow = newReadonlyStateFlow(false)
+        viewModel.setAdditionalInstanceField(VISIBILITY_FLOW_KEY, flow)
+        return flow
+    }
+
+    /**
+     * 把稳定 flow 装进 VM 的 `mobileTypeSingleVisible` 字段。
+     *
+     * **必须在视图 bind 之前调用**：视图 bind 时读到哪个 flow 对象，之后就只认那个对象。
+     * OS4 上 binder 直接从 MiuiMobileIconVMImpl（holder）取字段，所以 holder 也一并写入。
+     */
+    private fun prepareVisibilityFlow(viewModel: Any, holder: Any?) {
+        if (!shouldDriveLargeVisibility()) return
+        val flow = visibilityFlowOf(viewModel)
+        val current = runCatching { viewModel.getObjectField("mobileTypeSingleVisible") }.getOrNull()
+        if (current !== flow) {
+            runCatching { viewModel.setObjectField("mobileTypeSingleVisible", flow) }
+                .onSuccess { logVisibility("flow", "install -> ${viewModel.javaClass.simpleName}") }
+        }
+        if (holder != null && holder !== viewModel) {
+            val holderCurrent = runCatching { holder.getObjectField("mobileTypeSingleVisible") }.getOrNull()
+            if (holderCurrent != null && holderCurrent !== flow) {
+                runCatching { holder.setObjectField("mobileTypeSingleVisible", flow) }
+                    .onSuccess { logVisibility("flow", "holder patched -> ${holder.javaClass.simpleName}") }
+            }
+        }
+    }
+
+    /** 把当前判定结果写回该视图所属 VM 的稳定 flow，保证之后任何一次 rebind 都拿到同一结论 */
+    private fun syncLargeVisibilityFlow(rootView: ViewGroup, visible: Boolean) {
+        val viewModel = boundViewModels[rootView] ?: return
+        runCatching { setStateFlowValue(visibilityFlowOf(viewModel), visible) }
     }
 
     @SuppressLint("MissingPermission")
@@ -212,6 +286,8 @@ object MobileTypeSingle2Hook : BaseHook() {
                         interactor.getObjectField("wifiAvailable")
                     )
                     applyViewModelState(viewModel, interactor, subId)
+                    // applyViewModelState 会把字段换成双排代理 flow，这里再覆盖回模块的稳定 flow
+                    prepareVisibilityFlow(viewModel, vmImpl)
                 }
         } else {
             Constructors.find(miuiCellularIconVM).first().createAfterHook { param ->
@@ -234,15 +310,30 @@ object MobileTypeSingle2Hook : BaseHook() {
                 }.getOrNull() ?: return@createAfterHook
 
                 applyViewModelState(viewModel, interactor, subId)
+                prepareVisibilityFlow(viewModel, null)
             }
         }
 
         modernStatusBarMobileView.findAllMethods { name("constructAndBind") }
             .forEach { method ->
                 method.createInterceptHook { chain ->
+                    // 视图在 bind 时读到哪个 flow 对象，之后就只认那个对象，
+                    // 所以必须在 proceed 之前把模块的稳定 flow 装进 VM，否则视图订阅的是 MIUI 自己的 flow。
+                    val pendingViewModel = resolveConstructAndBindViewModel(chain.args.toList())
+                    if (pendingViewModel != null) {
+                        prepareVisibilityFlow(pendingViewModel, null)
+                    } else if (unresolvedViewModelLogCount < 3) {
+                        unresolvedViewModelLogCount++
+                        logVisibility(
+                            "bind",
+                            "constructAndBind 未解析出 VM: args=" +
+                                chain.args.joinToString { it?.javaClass?.simpleName ?: "null" }
+                        )
+                    }
                     val result = chain.proceed()
                     val rootView = result as? ViewGroup ?: return@createInterceptHook result
-                    val viewModel = resolveConstructAndBindViewModel(chain.args.toList())
+                    val viewModel = pendingViewModel
+                        ?: resolveConstructAndBindViewModel(chain.args.toList())
                         ?: return@createInterceptHook result
                     bindConstructedMobileViewIfNeeded(rootView, viewModel)
                     result
@@ -439,7 +530,8 @@ object MobileTypeSingle2Hook : BaseHook() {
         }.getOrNull() ?: return
 
         val callback = object : ConnectivityManager.NetworkCallback() {
-            private fun onWifiChanged() {
+            private fun onWifiChanged(tag: String) {
+                logVisibility("wifi", "$tag -> wifiConnectedNow=${safeIsWifiConnected()}")
                 // 立即刷一次让 UI 尽快跟上
                 scheduleRefreshBoundViews()
                 // 再在过渡窗口之后补算，覆盖"默认网络还没切换完"时算出的过渡态结果
@@ -449,12 +541,12 @@ object MobileTypeSingle2Hook : BaseHook() {
                 mainHandler.postDelayed(wifiSettleRefreshFarRunnable, WIFI_SETTLE_FAR_DELAY_MS)
             }
 
-            override fun onAvailable(network: Network) = onWifiChanged()
-            override fun onLost(network: Network) = onWifiChanged()
+            override fun onAvailable(network: Network) = onWifiChanged("onAvailable")
+            override fun onLost(network: Network) = onWifiChanged("onLost")
             override fun onCapabilitiesChanged(
                 network: Network,
                 networkCapabilities: NetworkCapabilities,
-            ) = onWifiChanged()
+            ) = onWifiChanged("onCapabilitiesChanged")
         }
         val request = NetworkRequest.Builder()
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
@@ -463,9 +555,10 @@ object MobileTypeSingle2Hook : BaseHook() {
             .onSuccess {
                 wifiNetworkCallback = callback
                 BaseHook.registerNetworkCallbackHotReloadCleanup(manager, callback)
+                logVisibility("wifi", "NetworkCallback 已注册")
             }
             .onFailure {
-                XposedLog.w(TAG, lpparam.packageName, "registerConnectivityWatcher failed: ${it.message}")
+                logVisibility("wifi", "registerConnectivityWatcher failed: ${it.message}")
             }
     }
 
@@ -486,6 +579,7 @@ object MobileTypeSingle2Hook : BaseHook() {
         val slotIndex = SubscriptionManager.getSlotIndex(subId)
         if (slotIndex == -1) return
         cacheBoundView(subId, rootView)
+        boundViewModels[rootView] = viewModel
 
         val mobileGroup = rootView.findViewByIdName("mobile_group") as LinearLayout
         val containerLeft = mobileGroup.findViewByIdName("mobile_signal_container") as ViewGroup
@@ -520,7 +614,8 @@ object MobileTypeSingle2Hook : BaseHook() {
 
             when (mobileNetworkType) {
                 0, 2 -> {
-                    viewModel.setObjectField("mobileTypeSingleVisible", newReadonlyStateFlow(false))
+                    // 复用已装好的稳定 flow（兜底），不再 new 新对象，否则已绑定视图会永久失联
+                    prepareVisibilityFlow(viewModel, null)
 
                     val defaultConnections = runCatching {
                         interactor?.getObjectFieldAs<Any>("connectRepo")
@@ -810,6 +905,8 @@ object MobileTypeSingle2Hook : BaseHook() {
             val view = iter.next()
             if (!view.isAttachedToWindow || view === rootView) {
                 iter.remove()
+                boundViewModels.remove(view)
+                lastLoggedVisible.remove(view)
             }
         }
         views.add(rootView)
@@ -828,6 +925,8 @@ object MobileTypeSingle2Hook : BaseHook() {
                 val rootView = iter.next()
                 if (!rootView.isAttachedToWindow) {
                     iter.remove()
+                    boundViewModels.remove(rootView)
+                    lastLoggedVisible.remove(rootView)
                     continue
                 }
                 applyBoundViewState(rootView)
@@ -853,11 +952,9 @@ object MobileTypeSingle2Hook : BaseHook() {
 
         val wifiConnectedNow = safeIsWifiConnected()
         // 现读该 subId 的 defaultConnections，避免用滞后的缓存值做判定
-        val normalizedWifiDefaultConnection = normalizeWifiDefaultConnection(
-            readIsWifiDefaultConnection(defaultConnectionsBySubId[targetSubId])
-                ?: isWifiDefaultConnection,
-            wifiConnectedNow
-        )
+        val rawWifiDefault = readIsWifiDefaultConnection(defaultConnectionsBySubId[targetSubId])
+            ?: isWifiDefaultConnection
+        val normalizedWifiDefaultConnection = normalizeWifiDefaultConnection(rawWifiDefault, wifiConnectedNow)
         val effectiveWifiDefaultConnection = normalizedWifiDefaultConnection ?: wifiConnectedNow
         val resolvedLargeVisible = visibilityResolver.resolveLargeMobileTypeVisibility(
             mobileTypeSingleVisible = renderState.mobileTypeSingleVisible,
@@ -877,6 +974,19 @@ object MobileTypeSingle2Hook : BaseHook() {
             fallbackVisible = mobileTypeSmallView?.isVisible ?: false
         )
 
+        if (shouldDriveLargeVisibility()) {
+            // 判定结果同时写回 VM 的稳定 flow：视图订阅的就是它，改了它会连带驱动 MIUI 的 binder
+            syncLargeVisibilityFlow(rootView, resolvedLargeVisible)
+            if (lastLoggedVisible[rootView] != resolvedLargeVisible) {
+                lastLoggedVisible[rootView] = resolvedLargeVisible
+                logVisibility(
+                    "apply",
+                    "viewSub=$viewSubId target=$targetSubId rawWifiDefault=$rawWifiDefault " +
+                        "wifiNow=$wifiConnectedNow -> large=$resolvedLargeVisible " +
+                        "tv=${mobileTypeSingleView != null} attached=${rootView.isAttachedToWindow}"
+                )
+            }
+        }
         viewRenderer.applyLargeMobileType(
             textView = mobileTypeSingleView,
             showName = renderState.showName,
