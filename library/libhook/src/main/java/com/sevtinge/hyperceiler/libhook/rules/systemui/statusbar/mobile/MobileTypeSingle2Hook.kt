@@ -26,6 +26,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Typeface
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Handler
 import android.os.Looper
 import android.telephony.SubscriptionManager
@@ -114,6 +118,12 @@ object MobileTypeSingle2Hook : BaseHook() {
     @Volatile
     private var isWifiDefaultConnection: Boolean? = null
 
+    @Volatile
+    private var wifiNetworkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** 每个 subId 对应的 defaultConnections StateFlow，用于刷新时现读实时值。 */
+    private val defaultConnectionsBySubId = ConcurrentHashMap<Int, Any>()
+
     private val boundViews = ConcurrentHashMap<Int, MutableSet<ViewGroup>>()
     private val renderStateStore = MobileTypeRenderStateStore()
     private val visibilityResolver = MobileTypeVisibilityResolver(
@@ -139,6 +149,9 @@ object MobileTypeSingle2Hook : BaseHook() {
         if (isEnableDouble) {
             getHotReloadRuntimeState(DATA_SIM_CONTEXT_KEY, Context::class.java)
                 ?.let(::registerDataSimBroadcast)
+        }
+        if (mobileNetworkType == 0 || mobileNetworkType == 2 || mobileNetworkType == 4) {
+            registerConnectivityWatcher()
         }
         hookMobileViewAndVM()
     }
@@ -354,12 +367,80 @@ object MobileTypeSingle2Hook : BaseHook() {
         return runCatching { MobileViewHelper.isWifiConnected() }.getOrNull()
     }
 
+    /**
+     * 从 defaultConnections 的 StateFlow 里现读"当前上网方式是否为 WiFi"。
+     *
+     * 现读而不是只依赖订阅回调，是因为 MIUI 的 flow 不保证在 WiFi 连/断的瞬间就推送，
+     * 只等推送就会"慢半拍"。
+     */
+    private fun readIsWifiDefaultConnection(defaultConnectionsFlow: Any?): Boolean? {
+        if (defaultConnectionsFlow == null) return null
+        val snapshot = runCatching { getStateFlowValue(defaultConnectionsFlow) }.getOrNull()
+        return readIsWifiDefaultFromSnapshot(snapshot)
+    }
+
+    /** 从 defaultConnections 的快照值里读"当前上网方式是否为 WiFi"。 */
+    private fun readIsWifiDefaultFromSnapshot(snapshot: Any?): Boolean? {
+        if (snapshot == null) return null
+        return runCatching {
+            snapshot.getObjectField("wifi")?.getBooleanField("isDefault")
+        }.getOrNull()
+    }
+
+    /**
+     * 统一"当前上网方式是否为 WiFi"。
+     *
+     * MIUI 的 defaultConnections flow 不保证在 WiFi 连/断的瞬间更新，所以以实时探测到的
+     * WiFi 连接状态为准，只在探测失败时才退回缓存值：
+     *  - 实时已连上 WiFi → 一定以上网 WiFi 计（缓存说 false 说明它还没跟上）
+     *  - 实时没连上、缓存却说 true → 缓存已过期
+     * 旧实现只纠正了后一种，所以"连上 WiFi 后大 5G 图标不消失 / 消失很慢"。
+     */
     private fun normalizeWifiDefaultConnection(rawIsWifiDefault: Boolean?, wifiConnectedNow: Boolean?): Boolean? {
         return when {
-            rawIsWifiDefault == true && wifiConnectedNow == false -> false
+            wifiConnectedNow == true -> true
+            rawIsWifiDefault == true -> false
             rawIsWifiDefault != null -> rawIsWifiDefault
             else -> wifiConnectedNow
         }
+    }
+
+    /**
+     * WiFi 一连一断就立刻重算可见性。
+     *
+     * 模块是在 MIUI 绑完视图之后才替换掉可见性 flow 的，MIUI 的 view 早已订阅原 flow，
+     * 所以图标最终显隐靠的是模块自己重算后写 isVisible。而重算入口
+     * [scheduleRefreshBoundViews] 原来只有 flow 推送/SIM 广播/视图绑定三个触发点，
+     * 没有任何一个是 WiFi 连断本身——这就是显隐滞后的直接原因。
+     */
+    @SuppressLint("MissingPermission")
+    private fun registerConnectivityWatcher() {
+        if (wifiNetworkCallback != null) return
+        val manager = runCatching {
+            EzXposed.appContext.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        }.getOrNull() ?: return
+
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            private fun onWifiChanged() = scheduleRefreshBoundViews()
+
+            override fun onAvailable(network: Network) = onWifiChanged()
+            override fun onLost(network: Network) = onWifiChanged()
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) = onWifiChanged()
+        }
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        runCatching { manager.registerNetworkCallback(request, callback) }
+            .onSuccess {
+                wifiNetworkCallback = callback
+                BaseHook.registerNetworkCallbackHotReloadCleanup(manager, callback)
+            }
+            .onFailure {
+                XposedLog.w(TAG, lpparam.packageName, "registerConnectivityWatcher failed: ${it.message}")
+            }
     }
 
     @RequiresPermission(Manifest.permission.READ_PHONE_STATE)
@@ -513,45 +594,47 @@ object MobileTypeSingle2Hook : BaseHook() {
                 val visible = !wifiOn
                 setStateFlowValue(visibleFlow, visible)
                 renderStateStore.updateMobileTypeSingleVisible(subId, visible)
+                scheduleRefreshBoundViews()
             }
         )
     }
 
     private fun bindMobileTypeSingleVisibilityWithDefaultConnections(viewModel: Any, defaultConnections: Any, subId: Int) {
         val visibleFlow = viewModel.getObjectField("mobileTypeSingleVisible")
-        val initialIsWifiDefault = runCatching {
-            getStateFlowValue(defaultConnections)
-                ?.getObjectField("wifi")
-                ?.getBooleanField("isDefault")
-        }.getOrNull() ?: (safeIsWifiConnected() ?: false)
+        defaultConnectionsBySubId[subId] = defaultConnections
+
+        val initialIsWifiDefault = normalizeWifiDefaultConnection(
+            readIsWifiDefaultConnection(defaultConnections),
+            safeIsWifiConnected()
+        ) ?: false
         val initialVisible = !initialIsWifiDefault
         setStateFlowValue(visibleFlow, initialVisible)
         renderStateStore.updateMobileTypeSingleVisible(subId, initialVisible)
         MiuiStub.javaAdapter.alwaysCollectFlow(
             defaultConnections,
             Consumer<Any> { conn ->
-                val isWifiDefault = runCatching {
-                    conn.getObjectField("wifi")?.getBooleanField("isDefault")
-                }.getOrNull() ?: (safeIsWifiConnected() ?: false)
+                val isWifiDefault = normalizeWifiDefaultConnection(
+                    readIsWifiDefaultFromSnapshot(conn),
+                    safeIsWifiConnected()
+                ) ?: false
                 val visible = !isWifiDefault
                 setStateFlowValue(visibleFlow, visible)
                 renderStateStore.updateMobileTypeSingleVisible(subId, visible)
+                scheduleRefreshBoundViews()
             }
         )
     }
 
     private fun syncWifiDefaultConnectionSnapshot(interactor: Any?) {
         val wifiConnectedNow = safeIsWifiConnected()
-        val currentIsWifiDefault = runCatching {
+        val defaultConnections = runCatching {
             interactor?.getObjectFieldAs<Any>("connectRepo")
                 ?.getObjectFieldAs<Any>("defaultConnections")
-                ?.let { defaultConnections ->
-                    getStateFlowValue(defaultConnections)
-                        ?.getObjectField("wifi")
-                        ?.getBooleanField("isDefault")
-                }
         }.getOrNull()
-        isWifiDefaultConnection = normalizeWifiDefaultConnection(currentIsWifiDefault, wifiConnectedNow)
+        isWifiDefaultConnection = normalizeWifiDefaultConnection(
+            readIsWifiDefaultConnection(defaultConnections),
+            wifiConnectedNow
+        )
     }
 
     /** 监听上网卡切换 + SIM 变化，刷新已绑定的官方 mobile 布局 */
@@ -600,19 +683,13 @@ object MobileTypeSingle2Hook : BaseHook() {
 
         if (defaultConnectionsCollectorSource !== miuiInt) {
             defaultConnectionsCollectorJob?.cancel()
-            val initialRawIsWifiDefault = runCatching {
-                getStateFlowValue(defaultConnections)
-                    ?.getObjectField("wifi")
-                    ?.getBooleanField("isDefault")
-            }.getOrNull()
+            val initialRawIsWifiDefault = readIsWifiDefaultConnection(defaultConnections)
             isWifiDefaultConnection = normalizeWifiDefaultConnection(initialRawIsWifiDefault, safeIsWifiConnected())
             scheduleRefreshBoundViews()
             defaultConnectionsCollectorJob = MiuiStub.javaAdapter.alwaysCollectFlow(
                 defaultConnections,
                 Consumer<Any> { conn ->
-                    val rawIsWifiDefault = runCatching {
-                        conn.getObjectField("wifi")?.getBooleanField("isDefault")
-                    }.getOrNull()
+                    val rawIsWifiDefault = readIsWifiDefaultFromSnapshot(conn)
                     isWifiDefaultConnection = normalizeWifiDefaultConnection(rawIsWifiDefault, safeIsWifiConnected())
                     scheduleRefreshBoundViews()
                 }
@@ -749,7 +826,12 @@ object MobileTypeSingle2Hook : BaseHook() {
         val inOutView = rootView.findViewByIdName("mobile_left_mobile_inout") as? ImageView
 
         val wifiConnectedNow = safeIsWifiConnected()
-        val normalizedWifiDefaultConnection = normalizeWifiDefaultConnection(isWifiDefaultConnection, wifiConnectedNow)
+        // 现读该 subId 的 defaultConnections，避免用滞后的缓存值做判定
+        val normalizedWifiDefaultConnection = normalizeWifiDefaultConnection(
+            readIsWifiDefaultConnection(defaultConnectionsBySubId[targetSubId])
+                ?: isWifiDefaultConnection,
+            wifiConnectedNow
+        )
         val effectiveWifiDefaultConnection = normalizedWifiDefaultConnection ?: wifiConnectedNow
         val resolvedLargeVisible = visibilityResolver.resolveLargeMobileTypeVisibility(
             mobileTypeSingleVisible = renderState.mobileTypeSingleVisible,
