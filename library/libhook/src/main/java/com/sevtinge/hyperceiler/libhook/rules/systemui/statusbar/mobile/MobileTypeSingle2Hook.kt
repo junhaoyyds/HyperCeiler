@@ -144,6 +144,26 @@ object MobileTypeSingle2Hook : BaseHook() {
     @SuppressLint("MissingPermission")
     private val refreshBoundViewsRunnable = Runnable { refreshBoundViewsNow() }
 
+    /**
+     * WiFi 连/断之后的"补算"。
+     *
+     * 系统在切换 WiFi 时，默认上网网络（activeNetwork）不会立刻更新：NetworkCallback 触发的那
+     * 一刻往往还能读到旧网络。此时马上重算就会把过渡态写进视图，把图标状态固化成错的
+     * （典型现象：断开 WiFi 后仍判定"当前是 WiFi 上网"→ 大 5G 图标一直不显示）。
+     * 所以在过渡窗口之后再补算两次，用稳态值覆盖掉过渡态结果。
+     */
+    @SuppressLint("MissingPermission")
+    private val wifiSettleRefreshNearRunnable = Runnable { refreshBoundViewsNow() }
+
+    @SuppressLint("MissingPermission")
+    private val wifiSettleRefreshFarRunnable = Runnable { refreshBoundViewsNow() }
+
+    private companion object {
+        /** WiFi 变化后补算的延迟：先近后远，覆盖系统默认网络的切换窗口 */
+        const val WIFI_SETTLE_NEAR_DELAY_MS = 800L
+        const val WIFI_SETTLE_FAR_DELAY_MS = 2500L
+    }
+
     override fun init() {
         BaseHook.registerHandlerHotReloadCleanup(mainHandler)
         if (isEnableDouble) {
@@ -421,7 +441,15 @@ object MobileTypeSingle2Hook : BaseHook() {
         }.getOrNull() ?: return
 
         val callback = object : ConnectivityManager.NetworkCallback() {
-            private fun onWifiChanged() = scheduleRefreshBoundViews()
+            private fun onWifiChanged() {
+                // 立即刷一次让 UI 尽快跟上
+                scheduleRefreshBoundViews()
+                // 再在过渡窗口之后补算，覆盖"默认网络还没切换完"时算出的过渡态结果
+                mainHandler.removeCallbacks(wifiSettleRefreshNearRunnable)
+                mainHandler.removeCallbacks(wifiSettleRefreshFarRunnable)
+                mainHandler.postDelayed(wifiSettleRefreshNearRunnable, WIFI_SETTLE_NEAR_DELAY_MS)
+                mainHandler.postDelayed(wifiSettleRefreshFarRunnable, WIFI_SETTLE_FAR_DELAY_MS)
+            }
 
             override fun onAvailable(network: Network) = onWifiChanged()
             override fun onLost(network: Network) = onWifiChanged()
