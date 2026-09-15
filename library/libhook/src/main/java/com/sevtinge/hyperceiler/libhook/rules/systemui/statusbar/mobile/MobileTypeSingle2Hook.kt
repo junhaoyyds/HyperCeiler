@@ -158,11 +158,9 @@ object MobileTypeSingle2Hook : BaseHook() {
     @SuppressLint("MissingPermission")
     private val wifiSettleRefreshFarRunnable = Runnable { refreshBoundViewsNow() }
 
-    private companion object {
-        /** WiFi 变化后补算的延迟：先近后远，覆盖系统默认网络的切换窗口 */
-        const val WIFI_SETTLE_NEAR_DELAY_MS = 800L
-        const val WIFI_SETTLE_FAR_DELAY_MS = 2500L
-    }
+    /** WiFi 变化后补算的延迟：先近后远，覆盖系统默认网络的切换窗口 */
+    private const val WIFI_SETTLE_NEAR_DELAY_MS = 800L
+    private const val WIFI_SETTLE_FAR_DELAY_MS = 2500L
 
     override fun init() {
         BaseHook.registerHandlerHotReloadCleanup(mainHandler)
