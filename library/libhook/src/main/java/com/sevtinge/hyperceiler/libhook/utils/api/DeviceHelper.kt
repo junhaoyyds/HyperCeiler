@@ -264,7 +264,7 @@ object DeviceHelper {
                 VersionInfo(35, 2.0f, 2.2f, SUPPORT_FULL),
 
                 // 部分功能未适配
-                // VersionInfo(37, 3.0f, 3.3f, SUPPORT_PARTIAL),
+                VersionInfo(37, 3.0f, 3.3f, SUPPORT_PARTIAL),
 
                 // 未适配
                 VersionInfo(36, 2.0f, 2.2f, SUPPORT_NOT)
