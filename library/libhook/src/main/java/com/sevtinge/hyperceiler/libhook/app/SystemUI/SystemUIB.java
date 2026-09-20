@@ -66,6 +66,7 @@ import com.sevtinge.hyperceiler.libhook.rules.systemui.lockscreen.LockScreenDoub
 import com.sevtinge.hyperceiler.libhook.rules.systemui.lockscreen.NotificationShowOnKeyguard;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.lockscreen.ScramblePIN;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.navigation.HideGestureLine;
+import com.sevtinge.hyperceiler.libhook.rules.systemui.navigation.HideNavigationBar;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.navigation.RotationButtonB;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.other.AutoSEffSwitchForSystemUi;
 import com.sevtinge.hyperceiler.libhook.rules.systemui.other.BrightnessPct;
@@ -186,6 +187,8 @@ public class SystemUIB extends BaseLoad {
         // colour win instead of being overwritten here.
         initHook(new HideGestureLine(), PrefsBridge.getBoolean("system_ui_hide_navigation_bar")
             && !PrefsBridge.getBoolean("system_ui_navigation_handle_custom"));
+        // #1707: 另一个包下的同名类，只禁绘制、保留手势热区
+        initHook(new HideNavigationBar(), PrefsBridge.getBoolean("system_ui_hide_navigation_bar"));
         initHook(RotationButtonB.INSTANCE, PrefsBridge.getStringAsInt("system_framework_other_rotation_button_int", 0) != 0);
 
         // 控制与通知中心
