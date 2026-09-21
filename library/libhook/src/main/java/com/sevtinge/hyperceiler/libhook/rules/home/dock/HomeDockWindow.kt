@@ -28,6 +28,7 @@ import android.os.Handler
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Parcel
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.view.Display
@@ -95,6 +96,19 @@ class HomeDockWindow : BaseHook() {
          * a mis-evaluated overlay flag can hold the Dock hidden until the next traversal.
          */
         const val SWEEP_BACKOFF_MAX_MS = 8_000L
+        /**
+         * Sweep interval while the panel is asleep (non-interactive).
+         *
+         * <p>Doze makes everything the sweep maintains moot: the launcher cannot draw, so no
+         * native sample can arrive, no geometry can visibly change, and the rotation gate cannot
+         * flip. 2026-09-17 measured this loop at a 1-2 s cadence through the night in system_server
+         * (each tick also re-reads dock preferences and the display rotation) - exactly the kind of
+         * idle cost a battery report blames on the panel. 30 s matches the native health worker's
+         * own doze gate; waking the screen restores the fast cadence via the first interactive
+         * traversal, which also calls [resetSweepCadence], so the worst case is one heartbeat of
+         * sweep absence after wake - invisible, because the traversal paths do the real work.
+         */
+        const val SWEEP_DOZE_INTERVAL_MS = 30_000L
         /** Reveal (821ms) plus a margin for the keyguard/home wallpaper swap to settle. */
         const val MATERIAL_SETTLE_MS = 1_600L
         /** Slack added to the rotation settle window before asking for the resuming traversal. */
@@ -310,6 +324,35 @@ class HomeDockWindow : BaseHook() {
         sweepIntervalMs = NATIVE_BIND_SWEEP_MS
     }
 
+    /**
+     * Resolved once and kept: the native health worker asks for the panel state on every pass, and
+     * resolving the service again each time would add a reflective field read per second for no
+     * benefit. system_server's own context outlives every hook installed here.
+     */
+    @Volatile private var powerManager: PowerManager? = null
+
+    /**
+     * Whether the panel is in an interactive state, answered to the launcher's native health worker.
+     *
+     * <p>With the panel in doze the launcher cannot draw, so no patched call site can run and
+     * maintaining those patches once a second is pure cost - it kept the launcher process waking
+     * through the whole night for a desktop nobody could see. The launcher's native side cannot
+     * read this itself: every path that carries the panel state (backlight, the DRM connector) is
+     * root-only on this ROM. system_server is where PowerManagerService lives, so answering here is
+     * a local read rather than a cross-process one.
+     *
+     * <p>Fail-open on purpose: a context or service that cannot be resolved answers "interactive",
+     * which keeps the worker running exactly as before instead of silently switching Dock
+     * maintenance off.
+     */
+    private fun screenInteractive(): Boolean = runCatching {
+        val manager = powerManager ?: run {
+            val context = service?.getObjectFieldAs<Context>("mContext")
+            context?.getSystemService(PowerManager::class.java)?.also { powerManager = it }
+        }
+        if (manager == null) true else manager.isInteractive
+    }.getOrDefault(true)
+
     override fun init() {
         refreshSettings()
         glassClient.record("hook init diagnosticVersion=34 enabled=${settings.enabled} mode=${settings.mode}")
@@ -433,16 +476,28 @@ class HomeDockWindow : BaseHook() {
                         }
                     }
                 transact.createAfterHook { param ->
-                    if (stopped || !DockNativeMotionEndpoint.handles(param.args[0] as Int)) {
+                    val code = param.args[0] as Int
+                    val state = code == DockNativeMotionEndpoint.STATE_TRANSACTION_CODE
+                    if (stopped
+                        || (!state && !DockNativeMotionEndpoint.handles(code))) {
                         return@createAfterHook
                     }
-                    // The original Stub sees an unknown private code. Confirm it only after all
-                    // before callbacks have had a chance to consume the restored input Parcel.
-                    val acknowledgment = nativeMotionReply.get() ?: DockNativeMotionEndpoint.ACK
-                    nativeMotionReply.remove()
                     val reply = param.args[2] as? Parcel ?: return@createAfterHook
                     reply.setDataPosition(0)
-                    reply.writeInt(acknowledgment)
+                    if (state) {
+                        // Answered here, not pushed: system_server is the only side that knows
+                        // whether the panel is interactive, and the launcher-native side has no
+                        // reverse channel to be told. The body is empty, so there is nothing to
+                        // parse in the before hook - it only has to leave the code alone.
+                        reply.writeInt(DockNativeMotionEndpoint.STATE_ACK)
+                        reply.writeInt(if (screenInteractive()) 1 else 0)
+                    } else {
+                        // The original Stub sees an unknown private code. Confirm it only after all
+                        // before callbacks have had a chance to consume the restored input Parcel.
+                        val acknowledgment = nativeMotionReply.get() ?: DockNativeMotionEndpoint.ACK
+                        nativeMotionReply.remove()
+                        reply.writeInt(acknowledgment)
+                    }
                     param.result = true
                 }
                 glassClient.record("native motion IWindowManager endpoint ready")
@@ -1762,6 +1817,15 @@ class HomeDockWindow : BaseHook() {
             if (stopped) return@postDelayed
             var keepGoing = false
             runCatching {
+                // Doze gate first: while the panel is asleep nothing below can matter, so spend
+                // one PowerManager read per tick instead of the whole sweep, and stretch the
+                // cadence to the doze interval. The next interactive tick restores the normal
+                // backoff behaviour on its own.
+                if (!screenInteractive()) {
+                    sweepIntervalMs = SWEEP_DOZE_INTERVAL_MS
+                    synchronized(layers) { keepGoing = layers.isNotEmpty() }
+                    return@runCatching
+                }
                 val changed = refreshSettings()
                 // The rotation gate has to be polled here: a rotated app hides the launcher window,
                 // WMS stops traversing it, and nothing else observes the display while that lasts.

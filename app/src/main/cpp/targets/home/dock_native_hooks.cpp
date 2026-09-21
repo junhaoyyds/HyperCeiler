@@ -34,6 +34,8 @@ bool prepare_dock_motion();
 void activate_dock_motion();
 void deactivate_dock_motion();
 bool dock_motion_feature_active();
+bool dock_motion_screen_active();
+bool refresh_dock_screen_state();
 void run_dock_motion();
 
 extern "C" {
@@ -1792,22 +1794,78 @@ void pause_for(long nanoseconds) {
     while (nanosleep(&remaining, &remaining) != 0 && errno == EINTR) {}
 }
 
+/*
+ * Retry ladder for a launcher runtime this build cannot match.
+ *
+ * Failing to resolve is not the same kind of failure as failing to read. The resolve pass copies
+ * every executable segment out of the image and pattern-scans that copy, which is tens of
+ * megabytes of syscall-backed reads per attempt. Retrying it every two seconds forever is what
+ * turns "following simply does not work on this launcher build" into a measurable battery drain:
+ * the desktop keeps the scan running all day for a hook it is never going to install.
+ *
+ * So the pass keeps its fast cadence while it is making progress and backs off once it stops. It
+ * is capped rather than stopped outright, because a launcher update can make the runtime matchable
+ * again and nothing else in this process would ever restart the loop.
+ */
+long unresolved_retry_delay(unsigned consecutive_failures) {
+    constexpr long kFirstNs = 2000000000L;
+    constexpr long kCapNs = 60000000000L;
+    long delay = kFirstNs;
+    for (unsigned step = 1; step < consecutive_failures && delay < kCapNs; ++step) {
+        delay *= 2;
+    }
+    return delay > kCapNs ? kCapNs : delay;
+}
+
 void *health_worker(void *) {
     // Named for field triage: this thread was identified by TID archaeology once, which cost far
     // more than the one line it takes to label it.
     (void)pthread_setname_np(pthread_self(), "hc-dock-health");
+    /* Consecutive passes that could not bring a hook bank up; cleared by any healthy pass. */
+    unsigned unresolved = 0;
     for (;;) {
         // With the Dock switched off there is nothing to maintain: skip the pass entirely, which
         // is what makes a disabled Dock cost the launcher nothing at all.
         if (!dock_motion_feature_active()) {
+            unresolved = 0;
             pause_for(5000000000L);
             continue;
         }
+        /*
+         * Panel gate. While the panel is in doze the launcher cannot draw, so not one patched call
+         * site can run and there is nothing to maintain - yet this loop kept waking once a second
+         * for the whole night, and it was measured as essentially the entire CPU cost of the
+         * launcher process while the screen was off.
+         *
+         * The state is asked of system_server (PowerManagerService lives there and the panel nodes
+         * are root-only, so a native read is not an option). The query is a synchronous
+         * IWindowManager transaction, which is what a maintenance pass already costs; while dozing
+         * the cadence below makes it one call every 30 s, so the cost rounds to nothing. The wake
+         * latency is bounded by that same interval, and a dozing launcher draws nothing for a
+         * missing patch to be visible in - the first interactive pass repairs before the desktop
+         * can be laid out again.
+         */
+        (void)refresh_dock_screen_state();
+        if (!dock_motion_screen_active()) {
+            pause_for(30000000000L);
+            continue;
+        }
         const bool healthy = maintain_dock_motion_hooks(false);
-        // 1 s in the steady state, 2 s while repairing. The pass itself is a handful of word
-        // reads now (A1/A3), so the cadence is no longer what the loop costs - it only bounds how
-        // long a kernel-restored patch can stay missing.
-        pause_for(healthy ? 1000000000L : 2000000000L);
+        if (healthy) {
+            unresolved = 0;
+            // 1 s in the steady state. The pass itself is a handful of word reads (A1/A3), so the
+            // cadence is no longer what the loop costs - it only bounds how long a kernel-restored
+            // patch can stay missing.
+            pause_for(1000000000L);
+            continue;
+        }
+        /*
+         * A pass that could not install a bank just paid for a full image copy and a pattern scan,
+         * and paying it again two seconds later changes nothing. Back off to a minute so an
+         * unmatched launcher build costs a scan per minute instead of thirty.
+         */
+        if (unresolved < 1000U) ++unresolved;
+        pause_for(unresolved_retry_delay(unresolved));
     }
 }
 
